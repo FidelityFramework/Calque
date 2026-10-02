@@ -2,7 +2,45 @@
 
 Calque formats Clef source. It is a focused fork of
 [Fantomas](https://github.com/fsprojects/fantomas), with a library, incremental
-formatting API and CLI hosted on .NET 10.
+formatting API and CLI hosted on .NET 10. It retains Fantomas's Oak syntax tree,
+comment and trivia handling, and printing pipeline, adapted to Clef's source
+conventions.
+
+## Formatting scope
+
+Calque currently formats the Clef syntax supported by its inherited parser and
+explicit syntax checks. Clef's language surface is still developing; a parser
+refusal can indicate a formatter gap, including in working programs such as
+HelloArty and HelloWayland. Broader support requires a Clef parser adapter.
+
+- Comments, literal spelling and source order are preserved. Numeric widths,
+  suffixes and conversions are left to the source and compiler.
+- Imperative bindings, loops and record updates are supported source forms.
+- Typed `<@ ... @>`, untyped `<@@ ... @@>` and nested quotations retain their
+  structure and contents without evaluation. Quotation splices (`%expr` and
+  `%%expr`) are refused under the current Clef contract; infix `%` remains valid.
+- Nulls, OO syntax and CLR widening such as `:> obj` are refused.
+
+## Components and integration
+
+| Component | Responsibility |
+| --- | --- |
+| `Calque.Core` | Oak, trivia handling and source layout |
+| `Calque.Syntax` | Pinned parser and syntax support |
+| `Calque.Incremental` | Formatting requests coordinated through Fidelity.FSharp.Incremental |
+| `Calque` | Command-line formatter |
+| `Calque.Tests` | Preservation, idempotence, refusal and lifecycle tests |
+
+`Calque.Incremental` binds each request to an immutable document revision and
+formatting configuration. It shares work between consumers, supports
+cancellation and rejects superseded results. Bozzetto uses this API to provide
+formatting previews alongside Composer's incremental compilation sessions.
+Applying a preview requires a current source revision; compiler diagnostics,
+proofs and execution remain owned by the compiler workflow.
+
+The coordinator currently parses and formats whole documents. Incremental
+syntax and trivia reuse, syntax markup and automatic editor application are
+future work; the current incremental API manages requests and their lifetimes.
 
 ## Build and use
 
