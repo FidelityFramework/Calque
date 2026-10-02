@@ -5,6 +5,20 @@ open Calque.Syntax.Diagnostics
 open Calque.Syntax.Parse
 open Calque.Syntax.Text
 
+[<RequireQualifiedAccess>]
+type internal FormattingPhase =
+  | SourcePreparation
+  | Parse
+  | Oak
+  | Trivia
+  | Dialect
+  | Print
+  | Merge
+
+/// An operation owns one instance; a foreign stop is still an unexpected fault.
+type internal FormattingStoppedException() =
+  inherit Exception("The formatting demand was withdrawn.")
+
 // The ways formatting can fail, and nothing else. Every one of them derives from `FormatException`,
 // which the CLI matches on to decide what to print, so a failure that reaches a caller with nothing
 // better to say still has a message rather than an empty string.

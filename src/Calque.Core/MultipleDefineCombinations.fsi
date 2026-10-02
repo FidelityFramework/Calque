@@ -13,3 +13,6 @@ module internal Calque.Core.MultipleDefineCombinations
 /// Because the split is by line, CodePrinter has to print a directive on a line of its own and may
 /// not move code across one. Illustrated in src/Calque.Core.Tests/MultipleDefineCombinationsTests.fs.
 val mergeMultipleFormatResults: config: FormatConfig -> results: (DefineCombination * FormatResult) list -> FormatResult
+
+val mergeMultipleFormatResultsWithCheckpoint:
+    checkpoint: (unit -> unit) -> config: FormatConfig -> results: (DefineCombination * FormatResult) list -> FormatResult

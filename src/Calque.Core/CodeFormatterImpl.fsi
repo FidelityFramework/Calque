@@ -28,6 +28,9 @@ val formatASTWith:
 /// invalidating diagnostic.
 val parse: isSignature: bool -> source: ISourceText -> Async<(ParsedInput * DefineCombination) array>
 
+val parseWithCheckpoint:
+    checkpoint: (unit -> unit) -> isStopped: (exn -> bool) -> isSignature: bool -> source: ISourceText -> Async<(ParsedInput * DefineCombination) array>
+
 /// The full pipeline: parse per define combination, format each tree in parallel with the source
 /// and cursor, and merge the results into one when there was more than one.
 val formatDocument:
@@ -41,3 +44,7 @@ val formatDocumentWith:
     source: ISourceText ->
     cursor: pos option ->
         Async<FormatResult>
+
+val formatDocumentWithCheckpoint:
+    checkpoint: (FormattingPhase -> unit) -> isStopped: (exn -> bool) -> inspectOak: (SyntaxOak.Oak -> unit) ->
+        config: FormatConfig -> isSignature: bool -> source: ISourceText -> cursor: pos option -> Async<FormatResult>

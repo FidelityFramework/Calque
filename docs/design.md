@@ -78,13 +78,19 @@ applying formatted text.
 
 The foundation carries explicit `WorkCancellation` to each evaluator, withdraws
 obsolete publication before cancellation, and joins evaluator and callback
-cleanup before replacing the same work. The production full-document formatter
-currently ignores that signal during parsing and printing. Its output is safely
-withdrawn, but it completes the running pipeline before replacement starts.
-A next step is cooperative checks between existing parse, Oak, trivia, dialect,
-print and merge phases. Every started conditional branch must still join, and a
-stop request must preserve genuine sibling failures. Interrupting within a
-synchronous phase is separate work; ambient cancellation must not detach it.
+cleanup before replacing the same work. The formatter checks that signal at
+phase boundaries and within parser token delivery, Oak construction, trivia and
+dialect walks, printing, output assembly and conditional-result merging. A stop
+unwinds the current synchronous work at its next checkpoint. Every started
+conditional branch still joins; an independent sibling fault takes precedence
+over the operation's own stop. Parser control failures never become source
+diagnostics. The checkpoint contract uses plain F# functions internally, with
+no additional scheduler or ambient cancellation authority.
+
+These are cooperative checkpoints, not preemption or a wall-clock latency
+guarantee. A single lexer token, string operation or intervening helper still
+runs to its next check. Source preparation and the initial parse are cold, and
+releasing one consumer does not interrupt formatting still demanded by a peer.
 
 This source-presentation path must proceed independently of Baker settlement,
 proof dispatch and target compilation. Incomplete editing buffers still need
@@ -94,10 +100,11 @@ incremental syntax/trivia reuse and markup results remain undelivered. Lattice's
 development VS Code client now offers an explicit immutable preview through a
 selected Bozzetto Composer session, including unsaved-buffer identity checks.
 Saving/applying that preview and shared compiler overlays remain separate work.
-Edit coalescing, cooperative interruption of synchronous parsing and
-edit-to-visible-result latency budgets remain acceptance work: replacing shared
-work waits for older attempts to drain. Protocol lifecycle tests establish
-ownership and freshness, not a design-time performance budget.
+Edit coalescing, incremental syntax reuse and edit-to-visible-result latency
+budgets remain acceptance work: replacing shared work waits for older attempts
+to drain. Tests exercise withdrawal inside the actual parser and printer, joined
+replacement and peer demand; they establish ownership and checkpoint behavior,
+not a design-time performance budget.
 
 ## Future presentation work
 

@@ -320,3 +320,177 @@ let ``close seals a cold formatter without starting any evaluation`` () =
   close handle
   DocumentFormatter.start handle |> expectError FormatterError.Closed
   Assert.That(calls, Is.Zero)
+
+let private substantialSource =
+  [ for index in 1 .. 40 -> $"// value {index}\nlet value{index}=({index}+1)*2\n" ]
+  |> String.concat "\n"
+
+let private phaseFromName = function
+  | "Parse" -> FormattingPhase.Parse
+  | "Oak" -> FormattingPhase.Oak
+  | "Trivia" -> FormattingPhase.Trivia
+  | "Dialect" -> FormattingPhase.Dialect
+  | "Print" -> FormattingPhase.Print
+  | name -> failwithf "unknown checkpoint phase %s" name
+
+[<Test; CancelAfter(10000)>]
+let ``format and parse workflows stay cold through source preparation and initial parse`` () =
+  let stopped = FormattingStoppedException()
+  let mutable checks = 0
+  let checkpoint _ =
+    checks <- checks + 1
+    raise stopped
+  let isStopped error = obj.ReferenceEquals(error, stopped)
+  let formatting = CodeFormatter.FormatDocumentWithCheckpointAsync(checkpoint, isStopped, false, substantialSource, FormatConfig.Default)
+  let parsing = CodeFormatterImpl.parseWithCheckpoint (fun () -> checkpoint FormattingPhase.Parse) isStopped false
+                  (CodeFormatterImpl.getSourceText substantialSource)
+  Assert.That(checks, Is.Zero)
+  let formatFailure = Assert.Catch(Action(fun () -> formatting |> run |> ignore))
+  Assert.That(formatFailure, Is.SameAs stopped)
+  Assert.That(checks, Is.EqualTo 1)
+  let parseFailure = Assert.Catch(Action(fun () -> parsing |> run |> ignore))
+  Assert.That(parseFailure, Is.SameAs stopped)
+  Assert.That(checks, Is.EqualTo 2)
+
+[<TestCase("Parse"); TestCase("Oak"); TestCase("Trivia"); TestCase("Dialect"); TestCase("Print")>]
+[<CancelAfter(10000)>]
+let ``real formatting stops inside the selected phase without completing it`` phaseName =
+  let target = phaseFromName phaseName
+  let stopped = FormattingStoppedException()
+  let mutable checks = 0
+  let checkpoint phase =
+    if phase = target then
+      checks <- checks + 1
+      if checks = 12 then raise stopped
+  let result =
+    Assert.Catch(Action(fun () ->
+      CodeFormatter.FormatDocumentWithCheckpointAsync(checkpoint, (fun error -> obj.ReferenceEquals(error, stopped)),
+        false, substantialSource, FormatConfig.Default)
+      |> run |> ignore))
+  Assert.That(result, Is.SameAs stopped, "the stop must not become a parse or source diagnostic")
+  Assert.That(checks, Is.EqualTo 12, "the real parser/walker/printer must not run the remainder")
+
+[<TestCase("Parse"); TestCase("Print")>]
+[<CancelAfter(10000)>]
+let ``withdrawal interrupts the real pipeline and replacement starts only after its drain`` phaseName =
+  let identity = document ()
+  let target = phaseFromName phaseName
+  let entered = signal ()
+  use resume = new ManualResetEventSlim(false)
+  let mutable oldChecks = 0
+  let mutable replacementChecks = 0
+  let inspect (source: SourceSnapshot) phase =
+    if source.Revision = 1UL && phase = target then
+      if Interlocked.Increment(&oldChecks) = 12 then
+        entered.TrySetResult() |> ignore
+        if not (resume.Wait(TimeSpan.FromSeconds 5.)) then failwith "pipeline checkpoint gate timed out"
+    elif source.Revision = 2UL then
+      Interlocked.Increment(&replacementChecks) |> ignore
+  let handle = DocumentFormatter.createWithCheckpoint settings identity inspect |> require
+  try
+    DocumentFormatter.start handle |> require
+    let original = snapshot identity 1UL substantialSource
+    let first = DocumentFormatter.request original handle |> require
+    waitSignal entered
+    DocumentFormatter.cancelCurrent handle |> require |> DocumentFormatter.observeControl |> run |> require
+    let replacement = snapshot identity 2UL "let replacement=42\n"
+    let next = DocumentFormatter.request replacement handle |> require
+    Assert.That(replacementChecks, Is.Zero, "the old evaluator still owns its blocked checkpoint")
+    DocumentFormatter.observe first handle |> run |> expectError FormatterError.Superseded
+    resume.Set()
+    let preview = DocumentFormatter.observe next handle |> run |> require
+    Assert.That(preview.Snapshot, Is.EqualTo replacement)
+    Assert.That(oldChecks, Is.EqualTo 12, "withdrawn parsing/printing must stop at the held checkpoint")
+    Assert.That(replacementChecks, Is.GreaterThan 0)
+    Assert.That(DocumentFormatter.drainDiagnostics handle, Is.Empty)
+  finally
+    resume.Set()
+    close handle
+
+[<Test; CancelAfter(10000)>]
+let ``releasing one real parser demand preserves its peer and shared computation`` () =
+  let identity = document ()
+  let entered = signal ()
+  use resume = new ManualResetEventSlim(false)
+  let mutable checks = 0
+  let mutable preparations = 0
+  let inspect _ phase =
+    if phase = FormattingPhase.SourcePreparation then Interlocked.Increment(&preparations) |> ignore
+    elif phase = FormattingPhase.Parse && Interlocked.Increment(&checks) = 12 then
+      entered.TrySetResult() |> ignore
+      if not (resume.Wait(TimeSpan.FromSeconds 5.)) then failwith "shared parser checkpoint timed out"
+  let handle = DocumentFormatter.createWithCheckpoint settings identity inspect |> require
+  try
+    DocumentFormatter.start handle |> require
+    let source = snapshot identity 1UL substantialSource
+    let first = DocumentFormatter.request source handle |> require
+    waitSignal entered
+    let peer = DocumentFormatter.request source handle |> require
+    release first handle
+    resume.Set()
+    let preview = DocumentFormatter.observe peer handle |> run |> require
+    Assert.That(preview.Snapshot, Is.EqualTo source)
+    match preview.Outcome with
+    | FormatOutcome.Formatted _ -> ()
+    | other -> Assert.Fail(sprintf "shared parser was not retained: %A" other)
+    Assert.That(checks, Is.GreaterThan 12)
+    Assert.That(preparations, Is.EqualTo 2, "one pipeline's before/after source preparation checks")
+    Assert.That(DocumentFormatter.drainDiagnostics handle, Is.Empty)
+  finally
+    resume.Set()
+    close handle
+
+[<TestCase(false); TestCase(true)>]
+[<CancelAfter(10000)>]
+let ``a conditional stop joins its sibling and cannot hide an independent fault`` foreignStop =
+  let stopped = FormattingStoppedException()
+  let failure: exn =
+    if foreignStop then FormattingStoppedException()
+    else InvalidOperationException "independent-conditional-fault"
+  let entered, stoppedBranch = signal (), signal ()
+  use releaseSibling = new ManualResetEventSlim(false)
+  let rec containsSecond (node: SyntaxOak.Node) =
+    match node with
+    | :? SyntaxOak.SingleTextNode as token when token.Text = "second" -> true
+    | _ -> node.Children |> Array.exists containsSecond
+  let inspect (oak: SyntaxOak.Oak) =
+    if containsSecond oak then
+      stoppedBranch.TrySetResult() |> ignore
+      raise stopped
+    else
+      entered.TrySetResult() |> ignore
+      if not (releaseSibling.Wait(TimeSpan.FromSeconds 5.)) then failwith "conditional cleanup gate timed out"
+      raise failure
+  let source = CodeFormatterImpl.getSourceText "#if FIRST\nlet first=1\n#else\nlet second=2\n#endif\n"
+  let workflow =
+    CodeFormatterImpl.formatDocumentWithCheckpoint ignore (fun error -> obj.ReferenceEquals(error, stopped))
+      inspect FormatConfig.Default false source None
+  let running = Async.StartAsTask workflow
+  try
+    waitSignal entered
+    waitSignal stoppedBranch
+    Assert.That(running.IsCompleted, Is.False, "a stopped branch does not abandon the owned sibling")
+    releaseSibling.Set()
+    let actual = Assert.Catch(Action(fun () -> running.GetAwaiter().GetResult() |> ignore))
+    Assert.That(actual, Is.SameAs failure)
+  finally
+    releaseSibling.Set()
+    try running.GetAwaiter().GetResult() |> ignore with _ -> ()
+
+[<Test; CancelAfter(10000)>]
+let ``a foreign stop from the real pipeline remains a host diagnostic`` () =
+  let identity = document ()
+  let foreign = FormattingStoppedException()
+  let mutable checks = 0
+  let inspect _ phase =
+    if phase = FormattingPhase.Parse && Interlocked.Increment(&checks) = 12 then raise foreign
+  let handle = DocumentFormatter.createWithCheckpoint settings identity inspect |> require
+  try
+    DocumentFormatter.start handle |> require
+    let request = DocumentFormatter.request (snapshot identity 1UL substantialSource) handle |> require
+    match DocumentFormatter.observe request handle |> run with
+    | Error (FormatterError.HostFailure failure) -> Assert.That(failure.Message, Is.EqualTo foreign.Message)
+    | other -> Assert.Fail(sprintf "foreign stop was swallowed: %A" other)
+    Assert.That(checks, Is.EqualTo 12, "the foreign failure must cross the parser's token/exception wrapper")
+    Assert.That(DocumentFormatter.drainDiagnostics handle, Has.Length.EqualTo 1)
+  finally close handle

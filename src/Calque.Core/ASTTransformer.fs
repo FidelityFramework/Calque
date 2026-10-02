@@ -37,9 +37,11 @@ let longIdentText (sli: SynLongIdent) : string =
 type CreationAide =
     {
         SourceText: ISourceText option
+        Checkpoint: unit -> unit
     }
 
     member x.TextFromSource fallback range =
+        x.Checkpoint ()
         match x.SourceText with
         | None -> fallback ()
         | Some sourceText -> sourceText.GetSubTextFromRange range
@@ -82,6 +84,7 @@ let operatorNeedsSpaceInsideParens (text: string) : bool =
     text.Length > 1 && String.startsWithOrdinal "*" text
 
 let mkSynIdent (creationAide: CreationAide) (SynIdent(ident, trivia)) =
+    creationAide.Checkpoint ()
     match trivia with
     | None -> mkIdent ident
     | Some(IdentTrivia.OriginalNotation text) -> stn text ident.idRange
@@ -190,6 +193,7 @@ let mkParsedHashDirective (creationAide: CreationAide) (ParsedHashDirective(iden
     ParsedHashDirectiveNode(ident, args, range)
 
 let mkConstant (creationAide: CreationAide) c r : Constant =
+    creationAide.Checkpoint ()
     // The fallback is a thunk because `%A` formats through reflection, and the source text is
     // nearly always there to make it unnecessary.
     let orElse (fallback: unit -> string) : Constant =
@@ -1394,6 +1398,7 @@ let mkExprAnonRecordFieldOrSpread (creationAide: CreationAide) (item: SynExprAno
         Some(ExprRecordFieldOrSpread.Spread(mkExprSpread creationAide spread))
 
 let mkExpr (creationAide: CreationAide) (e: SynExpr) : Expr =
+    creationAide.Checkpoint ()
     let exprRange = e.Range
 
     match e with
@@ -2128,6 +2133,7 @@ let mkTuplePat (creationAide: CreationAide) (pats: SynPat list) (commas: range l
     PatTupleNode([ yield Choice1Of2(mkPat creationAide head); yield! rest ], m)
 
 let mkPat (creationAide: CreationAide) (p: SynPat) =
+    creationAide.Checkpoint ()
     let patternRange = p.Range
 
     match p with
@@ -2492,6 +2498,7 @@ let mkModuleName (SynComponentInfo(synType = synType; range = m) as info) : Iden
     | _ -> invariantViolationAbout m info "module name is not an identifier"
 
 let mkModuleDecl (creationAide: CreationAide) (decl: SynModuleDecl) =
+    creationAide.Checkpoint ()
     let declRange = decl.Range
 
     match decl with
@@ -2709,6 +2716,7 @@ let mkTypeList creationAide ts rt m =
     TypeFunsNode(parameters, mkType creationAide rt, m)
 
 let mkType (creationAide: CreationAide) (t: SynType) : Type =
+    creationAide.Checkpoint ()
     let typeRange = t.Range
 
     match t with
@@ -4319,11 +4327,14 @@ let mkFullTreeRange ast =
         let astRange = unionRanges startPos endPos
         includeTrivia astRange trivia
 
-let mkOak (sourceText: ISourceText option) (ast: ParsedInput) =
-    let creationAide: CreationAide = { SourceText = sourceText }
+let mkOakWithCheckpoint checkpoint (sourceText: ISourceText option) (ast: ParsedInput) =
+    checkpoint ()
+    let creationAide: CreationAide = { SourceText = sourceText; Checkpoint = checkpoint }
 
     let fullRange = mkFullTreeRange ast
 
     match ast with
     | ParsedInput.ImplFile parsedImplFileInput -> mkImplFile creationAide parsedImplFileInput fullRange
     | ParsedInput.SigFile parsedSigFileInput -> mkSigFile creationAide parsedSigFileInput fullRange
+
+let mkOak sourceText ast = mkOakWithCheckpoint ignore sourceText ast

@@ -10,6 +10,9 @@ type CodeFormatter =
   static member FormatDocumentAsync:
     isSignature: bool * source: string * config: FormatConfig -> Async<FormatResult>
 
+  static member internal FormatDocumentWithCheckpointAsync:
+    checkpoint: (FormattingPhase -> unit) * isStopped: (exn -> bool) * isSignature: bool * source: string * config: FormatConfig -> Async<FormatResult>
+
   /// Parse each conditional syntax branch without invoking any semantic compiler service.
   static member ParseAsync:
     isSignature: bool * source: string -> Async<(ParsedInput * string list) array>

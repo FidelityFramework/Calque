@@ -1049,34 +1049,53 @@ let private fileIndexTableWarmup =
         (FileIndex.fileIndexOfFile "tmp.fsx" |> ignore
          FileIndex.fileIndexOfFile "tmp.fsi" |> ignore)
 
-let parseFile
+let parseFileWithCheckpoint
+    (checkpoint: unit -> unit)
     (isSignature: bool)
     (sourceText: ISourceText)
     (defines: string list)
     : ParsedInput * FSharpParserDiagnostic list
     =
+    checkpoint ()
     fileIndexTableWarmup.Force()
     let errorLogger = CapturingDiagnosticsLogger("ErrorHandler")
+    let mutable checkpointFailure: exn option = None
+    let isCheckpointFailure error =
+        checkpointFailure |> Option.exists (fun stopped -> obj.ReferenceEquals(stopped, error))
 
     let parseResult =
         let fileName = if isSignature then "tmp.fsi" else "tmp.fsx"
 
-        usingLexbufForParsing
-            (createLexbuf "preview" sourceText, fileName)
-            (fun lexbuf ->
+        try
+            usingLexbufForParsing
+                (createLexbuf "preview" sourceText, fileName)
+                (fun lexbuf ->
 
-                let lexfun = createLexerFunction defines lexbuf errorLogger
-                // both don't matter for Fantomas
-                let isLastCompiland = false
-                let isExe = false
+                    let lexer = createLexerFunction defines lexbuf errorLogger
+                    let lexfun state =
+                        try checkpoint ()
+                        with error ->
+                            checkpointFailure <- Some error
+                            reraise ()
+                        lexer state
+                    // both don't matter for Fantomas
+                    let isLastCompiland = false
+                    let isExe = false
 
-                try
-                    ParseInput(lexfun, errorLogger, lexbuf, None, fileName, (isLastCompiland, isExe))
-                with e ->
-                    errorLogger.StopProcessingRecovery e range0 // don't re-raise any exceptions, we must return None.
-                    EmptyParsedInput(fileName, (isLastCompiland, isExe))
-            )
+                    try
+                        ParseInput(lexfun, errorLogger, lexbuf, None, fileName, (isLastCompiland, isExe))
+                    with
+                    | e when isCheckpointFailure e -> reraise ()
+                    | e ->
+                        errorLogger.StopProcessingRecovery e range0 // don't re-raise any exceptions, we must return None.
+                        EmptyParsedInput(fileName, (isLastCompiland, isExe))
+                )
+        with
+        // The pinned lexer helper adds a source range around escaping errors.
+        // Unwrap only the exact checkpoint failure recorded by this invocation.
+        | WrappedError(error, _) when isCheckpointFailure error -> raise error
 
+    checkpoint ()
     let diagnostics =
         List.map
             (fun (p) ->
@@ -1104,3 +1123,6 @@ let parseFile
             errorLogger.Diagnostics
 
     parseResult, diagnostics
+
+let parseFile isSignature sourceText defines =
+  parseFileWithCheckpoint ignore isSignature sourceText defines

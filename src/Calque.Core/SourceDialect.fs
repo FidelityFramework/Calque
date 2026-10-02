@@ -5,7 +5,7 @@ open Calque.Core.SyntaxOak
 // Inspect syntax roles in the Oak, keeping strings, comments and quoted identifiers intact.
 // Clef has no CLR widening, nulls or object model. This guard refuses those parser forms;
 // it does not resolve names or decide what a qualified function call means.
-let ensureSupported (oak: Oak) : unit =
+let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
   let unsupported text =
     raise (FormatException($"Calque cannot yet format the Clef source form '{text}'."))
 
@@ -26,6 +26,7 @@ let ensureSupported (oak: Oak) : unit =
   // Long identifiers serve several source roles. Only a Type.LongIdent is an explicit type use;
   // a binding called obj, a field called obj or a qualified call must stay ordinary syntax.
   let rec inspectType t =
+    checkpoint ()
     let inspectPath path =
       path |> List.iter (function Choice1Of2 t -> inspectType t | Choice2Of2 _ -> ())
 
@@ -68,6 +69,7 @@ let ensureSupported (oak: Oak) : unit =
     | Type.Intersection node -> inspectPath node.TypesAndSeparators
 
   and inspectConstraint constraintNode =
+    checkpoint ()
     match constraintNode with
     | TypeConstraint.Single _
     | TypeConstraint.WhereNotSupportsNull _ -> ()
@@ -91,6 +93,7 @@ let ensureSupported (oak: Oak) : unit =
       | _ -> ())
 
   let rec visit (node: Node) =
+    checkpoint ()
     match node with
     | :? ITypeDefn as declaration when not declaration.Members.IsEmpty -> refuse "type members"
     | _ -> ()
@@ -162,3 +165,5 @@ let ensureSupported (oak: Oak) : unit =
     node.Children |> Array.iter visit
 
   visit oak
+
+let ensureSupported oak = ensureSupportedWithCheckpoint ignore oak

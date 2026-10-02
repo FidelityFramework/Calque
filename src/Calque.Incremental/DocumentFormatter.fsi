@@ -87,3 +87,6 @@ module DocumentFormatter =
   val internal createWith:
     Settings -> DocumentIdentity ->
       (SourceSnapshot -> WorkCancellation -> Async<FormatOutcome>) -> Result<Handle, FormatterError>
+
+  val internal createWithCheckpoint:
+    Settings -> DocumentIdentity -> (SourceSnapshot -> FormattingPhase -> unit) -> Result<Handle, FormatterError>

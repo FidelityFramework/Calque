@@ -28,6 +28,9 @@ val collectCommentTextsFromAST: sourceText: ISourceText -> ast: ParsedInput -> S
 /// The choices are illustrated in src/Calque.Core.Tests/TriviaAssignmentTests.fs.
 val enrichTree: config: FormatConfig -> sourceText: ISourceText -> ast: ParsedInput -> tree: Oak -> Oak
 
+val enrichTreeWithCheckpoint:
+    checkpoint: (unit -> unit) -> config: FormatConfig -> sourceText: ISourceText -> ast: ParsedInput -> tree: Oak -> Oak
+
 /// Record the editor's cursor in the Oak so that CodePrinter can report where it ends up.
 /// When the cursor sits inside a `SingleTextNode`, the node remembers it and the printer reports
 /// the same offset into the printed text. Otherwise a `Cursor` trivia is attached to the smallest

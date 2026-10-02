@@ -213,6 +213,7 @@ type Context =
         WriterEvents: EventList
         FormattedCursor: pos option
         DebugMode: bool
+        Checkpoint: unit -> unit
     }
 
     static member Default =
@@ -222,6 +223,7 @@ type Context =
             WriterEvents = EventList()
             FormattedCursor = None
             DebugMode = false
+            Checkpoint = ignore
         }
 
     static member Create config : Context =
@@ -286,6 +288,7 @@ type Context =
     member x.Column = x.WriterModel.Column
 
 let writerEvent (e: WriterEvent) (ctx: Context) : Context =
+    ctx.Checkpoint ()
     // One event could contain a multiline string or code comments.
     // These need to be split up in multiple events.
     // Splitting is rare, so keep the common case off the list-building path entirely.
@@ -306,6 +309,7 @@ let writerEvent (e: WriterEvent) (ctx: Context) : Context =
         let evs = WriterEvents.normalize e
 
         for ev in evs do
+            ctx.Checkpoint ()
             ctx.WriterEvents.Append(ev) |> ignore
 
         { ctx with
@@ -346,6 +350,7 @@ let dump (isSelection: bool) (ctx: Context) =
         sb.Append(String.replicate indent " ") |> ignore
 
     for ev in ctx.WriterEvents.ToSeq() do
+        ctx.Checkpoint ()
         match ev with
         | Write s
         | WriteTrivia s -> sb.Append(s) |> ignore
@@ -489,9 +494,10 @@ let coli f' (c: 'T seq) f (ctx: Context) =
     let mutable tryPick = true
     let mutable st = ctx
     let mutable i = 0
-    let e = c.GetEnumerator()
+    use e = c.GetEnumerator()
 
     while e.MoveNext() do
+        ctx.Checkpoint ()
         if tryPick then tryPick <- false else st <- f' st
 
         st <- f i e.Current st
@@ -502,9 +508,10 @@ let coli f' (c: 'T seq) f (ctx: Context) =
 let col f' (c: 'T seq) f (ctx: Context) =
     let mutable tryPick = true
     let mutable st = ctx
-    let e = c.GetEnumerator()
+    use e = c.GetEnumerator()
 
     while e.MoveNext() do
+        ctx.Checkpoint ()
         if tryPick then tryPick <- false else st <- f' st
         st <- f e.Current st
 
@@ -514,9 +521,10 @@ let col f' (c: 'T seq) f (ctx: Context) =
 let colEx f' (c: 'T seq) f (ctx: Context) =
     let mutable tryPick = true
     let mutable st = ctx
-    let e = c.GetEnumerator()
+    use e = c.GetEnumerator()
 
     while e.MoveNext() do
+        ctx.Checkpoint ()
         if tryPick then tryPick <- false else st <- f' e.Current st
         st <- f e.Current st
 

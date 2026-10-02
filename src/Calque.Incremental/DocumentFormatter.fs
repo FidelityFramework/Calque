@@ -127,7 +127,7 @@ module DocumentFormatter =
     return! loop retained
   }
 
-  let internal createWith (settings: Settings) (document: DocumentIdentity) evaluate =
+  let private createWithOutcome (settings: Settings) (document: DocumentIdentity) evaluate =
     if settings.CommandCapacity < 6 then
       Error (FormatterError.InvalidSettings "CommandCapacity must leave room for four input commands and two controls.")
     elif settings.MaxDemands < 1 then
@@ -153,13 +153,12 @@ module DocumentFormatter =
         | None -> return StepOutcome.Complete Completion.Cancelled
         | Some _ when WorkCancellation.isRequested cancellation -> return StepOutcome.Complete Completion.Cancelled
         | Some (generation, source) ->
-          // Full-document parsing/printing runs outside admission and retains its
-          // immutable snapshot until return, including after cancellation.
+          // The evaluator joins its branches before returning a result or stop.
           let! outcome = evaluate source cancellation
           let completion =
             lock store.Gate (fun () ->
-              match store.Current with
-              | Some current when current.Generation = generation && not store.Closing && not (WorkCancellation.isRequested cancellation) ->
+              match outcome, store.Current with
+              | Some outcome, Some current when current.Generation = generation && not store.Closing && not (WorkCancellation.isRequested cancellation) ->
                 let token = ValueToken (generation * 2UL + 1UL)
                 current.Outcome <- Some (token, { Snapshot = source; Outcome = outcome })
                 Completion.Succeeded token
@@ -173,21 +172,36 @@ module DocumentFormatter =
       | Error error -> Error (FormatterError.InvalidSettings (sprintf "%A" error))
       | Ok host -> Ok { Owner = Guid.NewGuid(); Document = document; Settings = settings; Store = store; Host = host }
 
-  let create settings document =
-    let evaluate (snapshot: SourceSnapshot) _ = async {
+  let internal createWith settings document evaluate =
+    createWithOutcome settings document (fun source cancellation -> async {
+      let! result = evaluate source cancellation
+      return Some result
+    })
+
+  let internal createWithCheckpoint settings document inspectCheckpoint =
+    let evaluate (snapshot: SourceSnapshot) cancellation = async {
+      let stopped = FormattingStoppedException()
+      let checkpoint phase =
+        inspectCheckpoint snapshot phase
+        if WorkCancellation.isRequested cancellation then raise stopped
       try
-        let! result = CodeFormatter.FormatDocumentAsync(snapshot.IsSignature, snapshot.Source, snapshot.Config)
-        return FormatOutcome.Formatted result
+        let! result =
+          CodeFormatter.FormatDocumentWithCheckpointAsync(checkpoint, (fun error -> obj.ReferenceEquals(error, stopped)),
+            snapshot.IsSignature, snapshot.Source, snapshot.Config)
+        return Some (FormatOutcome.Formatted result)
       with
+      | error when obj.ReferenceEquals(error, stopped) && WorkCancellation.isRequested cancellation -> return None
       | :? Calque.Core.InvariantViolationException as error -> return raise error
       | :? Calque.Core.ParseException as error ->
-        return FormatOutcome.Refused { Code = "CALQUE_PARSE"; Message = error.Message }
+        return Some (FormatOutcome.Refused { Code = "CALQUE_PARSE"; Message = error.Message })
       | :? Calque.Core.DefineParseException as error ->
-        return FormatOutcome.Refused { Code = "CALQUE_CONDITIONAL_PARSE"; Message = error.Message }
+        return Some (FormatOutcome.Refused { Code = "CALQUE_CONDITIONAL_PARSE"; Message = error.Message })
       | :? Calque.Core.FormatException as error ->
-        return FormatOutcome.Refused { Code = "CALQUE_FORMAT"; Message = error.Message }
+        return Some (FormatOutcome.Refused { Code = "CALQUE_FORMAT"; Message = error.Message })
     }
-    createWith settings document evaluate
+    createWithOutcome settings document evaluate
+
+  let create settings document = createWithCheckpoint settings document (fun _ _ -> ())
 
   let start (handle: Handle) =
     lock handle.Store.Gate (fun () ->

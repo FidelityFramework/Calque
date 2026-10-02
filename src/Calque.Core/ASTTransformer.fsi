@@ -13,3 +13,5 @@ open Calque.Core.SyntaxOak
 /// tree did not come from text, as `CodeFormatter.TransformAST` without a source does.
 /// The Oak comes back without trivia. `Trivia.enrichTree` adds it, and needs the source as well.
 val mkOak: sourceText: ISourceText option -> ast: ParsedInput -> Oak
+
+val mkOakWithCheckpoint: checkpoint: (unit -> unit) -> sourceText: ISourceText option -> ast: ParsedInput -> Oak

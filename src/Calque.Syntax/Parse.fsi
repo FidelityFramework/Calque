@@ -15,3 +15,9 @@ type FSharpParserDiagnostic =
 
 val parseFile:
     isSignature: bool -> sourceText: ISourceText -> defines: string list -> ParsedInput * FSharpParserDiagnostic list
+
+/// Check before every parser token. Callback failures remain control/host failures,
+/// never source diagnostics.
+val internal parseFileWithCheckpoint:
+    checkpoint: (unit -> unit) -> isSignature: bool -> sourceText: ISourceText ->
+        defines: string list -> ParsedInput * FSharpParserDiagnostic list

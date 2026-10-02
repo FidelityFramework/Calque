@@ -160,7 +160,8 @@ let isHashDirective (line: string) =
     || trimmed.StartsWith("#endif", StringComparison.Ordinal)
 
 /// Split the given `source` into the matching `CodeFragments`.
-let splitWhenHash (defines: DefineCombination) (newline: string) (source: string) : CodeFragment list =
+let splitWhenHash checkpoint (defines: DefineCombination) (newline: string) (source: string) : CodeFragment list =
+    checkpoint ()
     let lines = source.Split([| newline |], options = StringSplitOptions.None)
     let mutable fragmentsBuilder = ListCollector<CodeFragment>()
 
@@ -172,6 +173,7 @@ let splitWhenHash (defines: DefineCombination) (newline: string) (source: string
 
     (SplitHashState.Zero, lines)
     ||> Array.fold (fun acc line ->
+        checkpoint ()
         if isHashDirective line then
             // Only add the previous fragment if it had content
             match acc.LastLineInfo with
@@ -210,11 +212,12 @@ let splitWhenHash (defines: DefineCombination) (newline: string) (source: string
 
     fragmentsBuilder.Close()
 
-let mergeMultipleFormatResults config (results: (DefineCombination * FormatResult) list) : FormatResult =
+let mergeMultipleFormatResultsWithCheckpoint checkpoint config (results: (DefineCombination * FormatResult) list) : FormatResult =
     let allInFragments: FormatResultForDefines list =
         results
         |> List.map (fun (dc, result) ->
-            let fragments = splitWhenHash dc config.EndOfLine.NewLineString result.Code
+            checkpoint ()
+            let fragments = splitWhenHash checkpoint dc config.EndOfLine.NewLineString result.Code
 
             {
                 Result = result
@@ -252,6 +255,7 @@ Formatting was refused. Retain this diagnostic and its define configurations for
         (continuation: CodeFragment list -> CodeFragment list)
         : CodeFragment list
         =
+        checkpoint ()
         let headItems = List.choose List.tryHead input
 
         if List.isEmpty headItems then
@@ -271,6 +275,7 @@ Formatting was refused. Retain this diagnostic and its define configurations for
         | CodeFragment.Content _ -> builder.Append config.EndOfLine.NewLineString
 
     let appendContent (fragment: CodeFragment) (builder: StringBuilder) : StringBuilder =
+        checkpoint ()
         match fragment with
         | CodeFragment.NoContent _ -> builder
         | CodeFragment.HashLine(line = content)
@@ -333,3 +338,5 @@ Formatting was refused. Retain this diagnostic and its define configurations for
             Code = finalResult.ContentBuilder.ToString()
             Cursor = Option.map snd finalResult.FoundCursor
         }
+
+let mergeMultipleFormatResults config results = mergeMultipleFormatResultsWithCheckpoint ignore config results

@@ -58,6 +58,7 @@ type Context =
         /// When enabled, genNode emits NodeStart/NodeEnd WriterEvents around each Oak node.
         /// Only used by CodeFormatter.GetWriterEventsAsync for diagnostic output.
         DebugMode: bool
+        Checkpoint: unit -> unit
     }
 
     /// Initialize with a string writer and use space as delimiter

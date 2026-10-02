@@ -17,7 +17,7 @@ type CommentTrivia with
 
 /// Groups comments that follow each other on the same line with only whitespace between them.
 /// Every group holds at least one comment.
-let groupCommentsOnSameLine (source: ISourceText) (comments: CommentTrivia list) : CommentTrivia list list =
+let groupCommentsOnSameLine checkpoint (source: ISourceText) (comments: CommentTrivia list) : CommentTrivia list list =
     let followsOnSameLine (previous: CommentTrivia) (next: CommentTrivia) : bool =
         previous.Range.EndLine = next.Range.StartLine
         && source
@@ -29,6 +29,7 @@ let groupCommentsOnSameLine (source: ISourceText) (comments: CommentTrivia list)
     let currentGroup: ResizeArray<CommentTrivia> = ResizeArray()
 
     for comment in comments do
+        checkpoint ()
         if
             currentGroup.Count > 0
             && not (followsOnSameLine currentGroup.[currentGroup.Count - 1] comment)
@@ -44,6 +45,7 @@ let groupCommentsOnSameLine (source: ISourceText) (comments: CommentTrivia list)
     List.ofSeq groups
 
 let internal collectTriviaFromCodeComments
+    (checkpoint: unit -> unit)
     (source: ISourceText)
     (codeComments: CommentTrivia list)
     (codeRange: range)
@@ -56,6 +58,7 @@ let internal collectTriviaFromCodeComments
         source.GetLineString(r.EndLine - 1).Substring(r.EndColumn).TrimEnd(' ', ';').Length > 0
 
     let groupToTrivia (group: CommentTrivia list) : TriviaNode list =
+        checkpoint ()
         assert (not (List.isEmpty group))
         let first: CommentTrivia = List.head group
         let last: CommentTrivia = List.last group
@@ -68,6 +71,7 @@ let internal collectTriviaFromCodeComments
         else
             group
             |> List.map (fun ct ->
+                checkpoint ()
                 match ct with
                 | CommentTrivia.BlockComment r ->
                     TriviaNode(BlockComment(source.GetSubTextFromRange r, false, false), r)
@@ -76,11 +80,12 @@ let internal collectTriviaFromCodeComments
             )
 
     codeComments
-    |> List.filter (fun ct -> RangeHelpers.rangeContainsRange codeRange ct.Range)
-    |> groupCommentsOnSameLine source
+    |> List.filter (fun ct -> checkpoint (); RangeHelpers.rangeContainsRange codeRange ct.Range)
+    |> groupCommentsOnSameLine checkpoint source
     |> List.collect groupToTrivia
 
 let internal collectTriviaFromBlankLines
+    (checkpoint: unit -> unit)
     (config: FormatConfig)
     (source: ISourceText)
     (rootNode: Node)
@@ -112,6 +117,7 @@ let internal collectTriviaFromBlankLines
         pending.Push rootNode
 
         while pending.Count > 0 do
+            checkpoint ()
             let node: Node = pending.Pop()
 
             match node with
@@ -145,6 +151,7 @@ let internal collectTriviaFromBlankLines
 
     (min, [ min..max ])
     ||> List.chooseState (fun count idx ->
+        checkpoint ()
         if ignoreLines.Contains(idx + 1) then
             0, None
         else
@@ -175,6 +182,7 @@ type ConditionalDirectiveTrivia with
         | ConditionalDirectiveTrivia.EndIf m -> m
 
 let internal collectTriviaFromDirectiveRanges
+    (checkpoint: unit -> unit)
     (source: ISourceText)
     (directiveRanges: range list)
     (codeRange: range)
@@ -182,6 +190,7 @@ let internal collectTriviaFromDirectiveRanges
     =
     directiveRanges
     |> List.choose (fun directiveRange ->
+        checkpoint ()
         if not (RangeHelpers.rangeContainsRange codeRange directiveRange) then
             None
         else
@@ -191,7 +200,8 @@ let internal collectTriviaFromDirectiveRanges
         Some(TriviaNode(content, directiveRange))
     )
 
-let rec findNodeWhereRangeFitsIn (root: Node) (range: range) : Node option =
+let rec findNodeWhereRangeFitsInWithCheckpoint checkpoint (root: Node) (range: range) : Node option =
+    checkpoint ()
     let doesSelectionFitInNode = RangeHelpers.rangeContainsRange root.Range range
 
     if not doesSelectionFitInNode then
@@ -201,9 +211,11 @@ let rec findNodeWhereRangeFitsIn (root: Node) (range: range) : Node option =
     // The more specific the node fits the selection, the better
     let betterChildNode =
         root.Children
-        |> Array.tryPick (fun childNode -> findNodeWhereRangeFitsIn childNode range)
+        |> Array.tryPick (fun childNode -> findNodeWhereRangeFitsInWithCheckpoint checkpoint childNode range)
 
     betterChildNode |> Option.orElseWith (fun () -> Some root)
+
+let findNodeWhereRangeFitsIn root range = findNodeWhereRangeFitsInWithCheckpoint ignore root range
 
 let triviaBeforeOrAfterEntireTree (rootNode: Node) (trivia: TriviaNode) : unit =
     let isBefore = trivia.Range.EndLine < rootNode.Range.StartLine
@@ -476,7 +488,7 @@ let blockCommentToTriviaInstruction (containerNode: Node) (trivia: TriviaNode) :
 /// CommentOnSingleLine at column > 0, promote them into a single CommentOnSingleLineWithLeadingNewlines.
 /// This ensures the blank lines and comment are assigned to the same node.
 /// See https://github.com/fsprojects/fantomas/issues/2286
-let promoteNewlinesBeforeComments (trivia: TriviaNode array) : TriviaNode array =
+let promoteNewlinesBeforeComments checkpoint (trivia: TriviaNode array) : TriviaNode array =
     let result: ResizeArray<TriviaNode> = ResizeArray(trivia.Length)
     let pendingNewlines: ResizeArray<TriviaNode> = ResizeArray()
 
@@ -491,6 +503,7 @@ let promoteNewlinesBeforeComments (trivia: TriviaNode array) : TriviaNode array 
         && pendingNewlines.[pendingNewlines.Count - 1].Range.StartLine + 1 = line
 
     for t in trivia do
+        checkpoint ()
         match t.Content with
         | Newline ->
             // Only accumulate if this newline is adjacent to the previous one (consecutive blank lines).
@@ -520,9 +533,10 @@ let promoteNewlinesBeforeComments (trivia: TriviaNode array) : TriviaNode array 
     flushPendingNewlines ()
     result.ToArray()
 
-let addToTree (tree: Oak) (trivia: TriviaNode array) : unit =
+let addToTree checkpoint (tree: Oak) (trivia: TriviaNode array) : unit =
     for trivia in trivia do
-        let smallestNodeThatContainsTrivia = findNodeWhereRangeFitsIn tree trivia.Range
+        checkpoint ()
+        let smallestNodeThatContainsTrivia = findNodeWhereRangeFitsInWithCheckpoint checkpoint tree trivia.Range
 
         match smallestNodeThatContainsTrivia with
         | None -> triviaBeforeOrAfterEntireTree tree trivia
@@ -555,11 +569,12 @@ let internal collectCommentTextsFromAST (sourceText: ISourceText) (ast: ParsedIn
         | BlockComment(s, _, _) -> BlockComment(s.TrimEnd(), false, false)
         | other -> other
 
-    collectTriviaFromCodeComments sourceText parsedTrivia.CodeComments fullRange
+    collectTriviaFromCodeComments ignore sourceText parsedTrivia.CodeComments fullRange
     |> List.map (fun tn -> normalize tn.Content)
     |> Set.ofList
 
-let enrichTree (config: FormatConfig) (sourceText: ISourceText) (ast: ParsedInput) (tree: Oak) : Oak =
+let enrichTreeWithCheckpoint checkpoint (config: FormatConfig) (sourceText: ISourceText) (ast: ParsedInput) (tree: Oak) : Oak =
+    checkpoint ()
     let fullTreeRange = tree.Range
 
     let parsedTrivia =
@@ -569,10 +584,10 @@ let enrichTree (config: FormatConfig) (sourceText: ISourceText) (ast: ParsedInpu
 
     let trivia =
         let newlines =
-            collectTriviaFromBlankLines config sourceText tree parsedTrivia.CodeComments fullTreeRange
+            collectTriviaFromBlankLines checkpoint config sourceText tree parsedTrivia.CodeComments fullTreeRange
 
         let comments =
-            collectTriviaFromCodeComments sourceText parsedTrivia.CodeComments fullTreeRange
+            collectTriviaFromCodeComments checkpoint sourceText parsedTrivia.CodeComments fullTreeRange
 
         let directiveRanges =
             (parsedTrivia.ConditionalDirectives |> List.map _.Range)
@@ -584,13 +599,15 @@ let enrichTree (config: FormatConfig) (sourceText: ISourceText) (ast: ParsedInpu
                ))
 
         let directives =
-            collectTriviaFromDirectiveRanges sourceText directiveRanges fullTreeRange
+            collectTriviaFromDirectiveRanges checkpoint sourceText directiveRanges fullTreeRange
 
         [| yield! comments; yield! newlines; yield! directives |]
         |> Array.sortBy (fun n -> n.Range.Start.Line, n.Range.Start.Column)
 
-    addToTree tree (promoteNewlinesBeforeComments trivia)
+    addToTree checkpoint tree (promoteNewlinesBeforeComments checkpoint trivia)
     tree
+
+let enrichTree config sourceText ast tree = enrichTreeWithCheckpoint ignore config sourceText ast tree
 
 let insertCursor (tree: Oak) (cursor: pos) =
     let cursorRange = Range.mkRange (tree :> Node).Range.FileName cursor cursor
@@ -598,6 +615,6 @@ let insertCursor (tree: Oak) (cursor: pos) =
 
     match nodeWithCursor with
     | Some(:? SingleTextNode as node) -> node.AddCursor cursor
-    | _ -> addToTree tree [| TriviaNode(TriviaContent.Cursor, cursorRange) |]
+    | _ -> addToTree ignore tree [| TriviaNode(TriviaContent.Cursor, cursorRange) |]
 
     tree

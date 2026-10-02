@@ -6,10 +6,18 @@ open SyntaxOak
 [<AbstractClass; Sealed>]
 type CodeFormatter private () =
   static member FormatDocumentAsync(isSignature: bool, source: string, config: FormatConfig) : Async<FormatResult> =
-    source
-    |> CodeFormatterImpl.getSourceText
-    |> fun sourceText ->
-      CodeFormatterImpl.formatDocumentWith SourceDialect.ensureSupported config isSignature sourceText None
+    CodeFormatter.FormatDocumentWithCheckpointAsync(ignore, (fun _ -> false), isSignature, source, config)
+
+  static member internal FormatDocumentWithCheckpointAsync
+    (checkpoint: FormattingPhase -> unit, isStopped: exn -> bool, isSignature: bool, source: string, config: FormatConfig) : Async<FormatResult> = async {
+    checkpoint FormattingPhase.SourcePreparation
+    let sourceText = CodeFormatterImpl.getSourceText source
+    checkpoint FormattingPhase.SourcePreparation
+    return!
+      CodeFormatterImpl.formatDocumentWithCheckpoint checkpoint isStopped
+        (SourceDialect.ensureSupportedWithCheckpoint (fun () -> checkpoint FormattingPhase.Dialect))
+        config isSignature sourceText None
+  }
 
   static member ParseAsync(isSignature: bool, source: string) : Async<(ParsedInput * string list) array> =
     async {

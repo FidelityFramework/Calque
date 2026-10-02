@@ -191,6 +191,7 @@ let recordCursorIfSingleTextNode (n: Node) (f: Context -> Context) (ctx: Context
     | _ -> f ctx
 
 let genNode<'n when 'n :> Node> (n: 'n) (f: Context -> Context) (ctx: Context) =
+    ctx.Checkpoint ()
     // The NodeStart/NodeEnd payloads are only ever observed via CodeFormatter.GetWriterEventsAsync.
     // Keep them out of the default path entirely: building them costs a reflection call and a sprintf per node.
     if not ctx.DebugMode then
