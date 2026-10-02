@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Revision-bound demanded Calque formatting through the shared incremental foundation.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="DocumentFormatter.fsi" />
+    <Compile Include="DocumentFormatter.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Calque.Core/Calque.Core.fsproj" />
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Fidelity.FSharp.Incremental.Hosting" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,18 @@
+# Fidelity.FSharp.Incremental package input
+
+These MIT packages are the explicit preview.6 dependency for Calque's .NET-hosted
+source formatting adapter. They are byte-identical to Bozzetto's reviewed
+compiler/provider inputs and were packed from implementation commit
+`3b86e2dac96ad55cb965341bfc04395061d09c46` in
+[Fidelity.FSharp.Incremental](https://forge.spkez.dev/FidelityFramework/Fidelity.FSharp.Incremental).
+`SHA256SUMS` identifies the exact archives; their nuspecs identify the source.
+The identical archives are retained in each consumer's local feed so restoring
+one checkout does not silently choose another developer's mutable library build.
+No FDA or IcedTasks dependency is added.
+
+Validate with `sha256sum -c SHA256SUMS` in this directory. Refresh by packing a
+reviewed, tested library commit into external scratch, then updating both package
+pins, archives and checksums together. Never overwrite an already published
+version with different bytes. Consumer validation must identify its actual
+compiler, library and provider closure; package restoration alone is not proof,
+artifact or lifetime acceptance.

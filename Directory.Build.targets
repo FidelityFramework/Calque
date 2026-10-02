@@ -1,0 +1,8 @@
+<Project>
+  <ItemGroup Condition="'$(IsPackable)' == 'true'">
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="/" />
+    <None Include="$(MSBuildThisFileDirectory)LICENSE.md" Pack="true" PackagePath="/" />
+    <None Include="$(MSBuildThisFileDirectory).deps/$(FCSCommitHash)/License.txt" Link="licenses/FSharp.License.txt" Pack="true" PackagePath="licenses/FSharp.License.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory).deps/$(FCSCommitHash)/attributions.md" Link="licenses/FSharp.attributions.md" Pack="true" PackagePath="licenses/FSharp.attributions.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

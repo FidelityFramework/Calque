@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Hosts the vendored FSharpEmbedResourceText MSBuild task, which turns FSComp.txt into the SR module.
+    The task shipped in the .NET SDK is older than the compiler sources we vendor: since
+    dotnet/fsharp#20097 the generated diagnostic accessors return RichText instead of string, and the
+    SDK's task cannot generate those. Upstream solves this by bootstrapping its own FSharp.Build, we
+    solve it by vendoring the task, and the files it depends on, and compiling them here.
+    FSharpEnvironment.fs stands in for the upstream module of that name, see the file.
+
+    This is build tooling. It is never packed and never referenced at runtime.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Calque.Syntax.BuildTasks</AssemblyName>
+    <RootNamespace>Calque.Syntax.Build</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- MSBuild loads the task from this folder, so its dependencies have to be beside it. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- The task is vendored verbatim, so it is not held to this repo's warning settings. -->
+    <WarningsAsErrors />
+    <WarnOn />
+    <NoWarn>$(NoWarn);FS0025;FS1182;FS3390;FS1178;FS0064;FS0040</NoWarn>
+    <!-- A new project has no lock file yet, and this one is not shipped. -->
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+    <RestoreLockedMode>false</RestoreLockedMode>
+    <!-- Analyzers run over the products, not over vendored build tooling. -->
+    <RunAnalyzers>false</RunAnalyzers>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\.deps\$(FCSCommitHash)\src\Compiler\Utilities\NullHelpers.fs">
+      <Link>NullHelpers.fs</Link>
+    </Compile>
+    <Compile Include="FSharpEnvironment.fs" />
+    <Compile Include="..\..\.deps\$(FCSCommitHash)\src\FSharp.Build\TaskEnvironmentPaths.fs">
+      <Link>TaskEnvironmentPaths.fs</Link>
+    </Compile>
+    <Compile Include="..\..\.deps\$(FCSCommitHash)\src\FSharp.Build\FSharpEmbedResourceText.fs">
+      <Link>FSharpEmbedResourceText.fs</Link>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <!-- Provided by the MSBuild that hosts the task, so never copied to the output. -->
+    <Reference Include="Microsoft.Build.Framework">
+      <HintPath>$(MSBuildBinPath)/Microsoft.Build.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Build.Utilities.Core">
+      <HintPath>$(MSBuildBinPath)/Microsoft.Build.Utilities.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="AcquireCompilerFiles" BeforeTargets="CollectPackageReferences">
+    <Exec Command="bash &quot;$(MSBuildThisFileDirectory)../../scripts/acquire-syntax&quot; &quot;$(FCSCommitHash)&quot;" />
+  </Target>
+
+</Project>

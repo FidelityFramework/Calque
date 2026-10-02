@@ -1,0 +1,20 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Version>0.1.0</Version>
+    <Authors>Fidelity Framework; Fantomas contributors</Authors>
+    <Description>Calque: focused syntax formatting for Clef.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://forge.spkez.dev/FidelityFramework/Calque</RepositoryUrl>
+    <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+    <WarningsAsErrors>FS0025;FS1182</WarningsAsErrors>
+    <WarnOn>1182</WarnOn>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
+    <FCSCommitHash>5e9647f158fe282462aba57ed83ada910a91b90e</FCSCommitHash>
+  </PropertyGroup>
+</Project>

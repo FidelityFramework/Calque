@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="FormattingTests.fs" />
+    <Compile Include="CliTests.fs" />
+    <Compile Include="FixtureTests.fs" />
+    <Compile Include="QuotationTests.fs" />
+    <Compile Include="IncrementalFormattingTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Calque/Calque.fsproj" />
+    <ProjectReference Include="../Calque.Incremental/Calque.Incremental.fsproj" />
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="NUnit" />
+    <PackageReference Include="NUnit3TestAdapter" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="Fixtures/*.clef" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

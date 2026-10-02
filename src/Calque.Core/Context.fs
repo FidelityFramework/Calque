@@ -1,0 +1,1297 @@
+module internal Calque.Core.Context
+
+open System
+open Calque.Syntax.Text
+open Calque.Core
+open Calque.Core.SyntaxOak
+
+[<return: Struct>]
+let (|CommentOrDefineEvent|_|) (we: WriterEvent) : WriterEvent voption =
+    match we with
+    | WriteTrivia _ -> ValueSome we
+    | _ -> ValueNone
+
+[<return: Struct>]
+let (|EmptyWrite|_|) (we: WriterEvent) : unit voption =
+    match we with
+    | Write v
+    | WriteTrivia v ->
+        if String.IsNullOrWhiteSpace v then
+            ValueSome()
+        else
+            ValueNone
+    | _ -> ValueNone
+
+type ShortExpressionInfo =
+    {
+        MaxWidth: int
+        StartColumn: int
+        ConfirmedMultiline: bool
+    }
+
+    member x.IsTooLong maxPageWidth currentColumn =
+        currentColumn - x.StartColumn > x.MaxWidth // expression exceeds MaxWidth
+        || (currentColumn > maxPageWidth) // expression goes over the page width
+
+type Size =
+    | CharacterWidth of maxWidth: Num
+    | NumberOfItems of items: Num * maxItems: Num
+
+type WriteModelMode =
+    | Standard
+    | Dummy
+    | ShortExpression of ShortExpressionInfo list
+
+type WriterModel =
+    {
+        LineCount: int
+        Indent: int
+        AtColumn: int
+        WriteBeforeNewline: string
+        Mode: WriteModelMode
+        Column: int
+    }
+
+    member __.IsDummy =
+        match __.Mode with
+        | Dummy -> true
+        | _ -> false
+
+/// A loop rather than `List.exists` with a lambda: this runs for every event of a short
+/// expression, and the lambda would be a closure allocated each time.
+let rec anyTooLong (maxPageWidth: int) (currentColumn: int) (infos: ShortExpressionInfo list) : bool =
+    match infos with
+    | [] -> false
+    | info :: rest ->
+
+    info.IsTooLong maxPageWidth currentColumn
+    || anyTooLong maxPageWidth currentColumn rest
+
+module WriterModel =
+    /// A function rather than a value: a module-level value is a static field, and a thread
+    /// reading it while the module is still initializing sees null. Every context starts from
+    /// a fresh record anyway, so there is nothing to share.
+    let init () =
+        {
+            LineCount = 0
+            Indent = 0
+            AtColumn = 0
+            WriteBeforeNewline = ""
+            Mode = Standard
+            Column = 0
+        }
+
+    /// Process a single WriterEvent and return the updated WriterModel.
+    /// This only tracks lightweight metadata (line count, column, indent) — no string building.
+    /// String materialization happens later in `dump` by walking the EventList.
+    let update maxPageWidth cmd m =
+        let doNewline m =
+            let m =
+                { m with
+                    Indent = max m.Indent m.AtColumn
+                }
+
+            { m with
+                LineCount = m.LineCount + 1
+                WriteBeforeNewline = ""
+                Column = m.Indent
+            }
+
+        let updateCmd cmd =
+            match cmd with
+            | WriteLine
+            | WriteLineBecauseOfTrivia -> doNewline m
+            | WriteLineInsideStringConst ->
+                { m with
+                    LineCount = m.LineCount + 1
+                    Column = 0
+                }
+            | WriteLineInsideTrivia ->
+                { m with
+                    LineCount = m.LineCount + 1
+                    Column = 0
+                }
+            | Write s
+            | WriteTrivia s ->
+                { m with
+                    Column = m.Column + (String.visualWidth s)
+                }
+            | WriteBeforeNewline s -> { m with WriteBeforeNewline = s }
+            | IndentBy x ->
+                { m with
+                    Indent =
+                        if m.AtColumn >= m.Indent + x then
+                            m.AtColumn + x
+                        else
+                            m.Indent + x
+                }
+            | UnIndentBy x ->
+                { m with
+                    Indent = max m.AtColumn (m.Indent - x)
+                }
+            | SetAtColumn c -> { m with AtColumn = c }
+            | RestoreAtColumn c -> { m with AtColumn = c }
+            | SetIndent c -> { m with Indent = c }
+            | RestoreIndent c -> { m with Indent = c }
+            | NodeStart _
+            | NodeEnd _
+            | Start
+            | Placeholder -> m
+
+        match m.Mode with
+        | Dummy
+        | Standard -> updateCmd cmd
+        | ShortExpression infos when (List.exists (fun info -> info.ConfirmedMultiline) infos) -> m
+        | ShortExpression infos ->
+            let nextCmdCausesMultiline =
+                match cmd with
+                | WriteLine
+                | WriteLineBecauseOfTrivia -> true
+                | WriteLineInsideStringConst -> true
+                | Write _
+                | WriteTrivia _ when (String.isNotNullOrEmpty m.WriteBeforeNewline) -> true
+                | _ -> false
+
+            // Nearly every event confirms nothing, and then the infos are left as they are: only
+            // rebuild them once one of them is known to be multiline.
+            if not nextCmdCausesMultiline && not (anyTooLong maxPageWidth m.Column infos) then
+                updateCmd cmd
+            else
+
+            let updatedInfos =
+                infos
+                |> List.map (fun info ->
+                    let tooLong = info.IsTooLong maxPageWidth m.Column
+
+                    { info with
+                        ConfirmedMultiline = tooLong || nextCmdCausesMultiline
+                    }
+                )
+
+            { m with
+                Mode = ShortExpression(updatedInfos)
+            }
+
+module WriterEvents =
+    let normalize ev =
+        match ev with
+        | Write s
+        | WriteTrivia s when s.Contains("\n") ->
+            let writeLine =
+                match ev with
+                | CommentOrDefineEvent _ -> WriteLineInsideTrivia
+                | _ -> WriteLineInsideStringConst
+
+            // Preserve the event kind so comment lines remain WriteTrivia
+            let wrap =
+                match ev with
+                | WriteTrivia _ -> WriteTrivia
+                | _ -> Write
+
+            // Trustworthy multiline string in the original AST can contain \r
+            // Internally we process everything with \n and at the end we respect the .editorconfig end_of_line setting.
+            s.Replace("\r", "").Split('\n')
+            |> Seq.map (fun x -> [ wrap x ])
+            |> Seq.reduce (fun x y -> x @ [ writeLine ] @ y)
+            |> Seq.toList
+        | _ -> [ ev ]
+
+    let isMultiline (evs: EventList) =
+        evs.ToSeq()
+        |> Seq.exists (
+            function
+            | WriteLine
+            | WriteLineBecauseOfTrivia -> true
+            | _ -> false
+        )
+
+[<System.Diagnostics.DebuggerDisplay("\"{Dump()}\""); NoComparison>]
+type Context =
+    {
+        Config: FormatConfig
+        WriterModel: WriterModel
+        WriterEvents: EventList
+        FormattedCursor: pos option
+        DebugMode: bool
+    }
+
+    static member Default =
+        {
+            Config = FormatConfig.Default
+            WriterModel = WriterModel.init ()
+            WriterEvents = EventList()
+            FormattedCursor = None
+            DebugMode = false
+        }
+
+    static member Create config : Context =
+        { Context.Default with Config = config }
+
+    member x.WithDummy(f: Context -> Context, ?keepPageWidth) =
+        let keepPageWidth = keepPageWidth |> Option.defaultValue false
+
+        let backupPoint = x.WriterEvents.CreateBackupPoint()
+
+        let dummyCtx =
+            let config =
+                { x.Config with
+                    MaxLineLength =
+                        if keepPageWidth then
+                            x.Config.MaxLineLength
+                        else
+                            Int32.MaxValue
+                }
+
+            { x with
+                WriterModel =
+                    { x.WriterModel with
+                        Mode = Dummy
+                        WriteBeforeNewline = ""
+                    }
+                Config = config
+            }
+
+        let result = f dummyCtx
+        x.WriterEvents.RollbackTo(backupPoint)
+        result
+
+    member x.WithShortExpression(maxWidth, ?startColumn) =
+        let info =
+            {
+                MaxWidth = maxWidth
+                StartColumn = Option.defaultValue x.WriterModel.Column startColumn
+                ConfirmedMultiline = false
+            }
+
+        match x.WriterModel.Mode with
+        | ShortExpression infos ->
+            if List.exists (fun i -> i = info) infos then
+                x
+            else
+
+            { x with
+                WriterModel =
+                    { x.WriterModel with
+                        Mode = ShortExpression(info :: infos)
+                    }
+            }
+        | _ ->
+            { x with
+                WriterModel =
+                    { x.WriterModel with
+                        Mode = ShortExpression([ info ])
+                    }
+            }
+
+    member x.Column = x.WriterModel.Column
+
+let writerEvent (e: WriterEvent) (ctx: Context) : Context =
+    // One event could contain a multiline string or code comments.
+    // These need to be split up in multiple events.
+    // Splitting is rare, so keep the common case off the list-building path entirely.
+    let isSingleEvent =
+        match e with
+        | Write s
+        // IndexOf(char) is the ordinal single-character search; string.Contains(char) is not available on netstandard2.0.
+        | WriteTrivia s -> isNull s || s.IndexOf('\n') < 0
+        | _ -> true
+
+    if isSingleEvent then
+        ctx.WriterEvents.Append(e) |> ignore
+
+        { ctx with
+            WriterModel = WriterModel.update ctx.Config.MaxLineLength e ctx.WriterModel
+        }
+    else
+        let evs = WriterEvents.normalize e
+
+        for ev in evs do
+            ctx.WriterEvents.Append(ev) |> ignore
+
+        { ctx with
+            WriterModel =
+                (ctx.WriterModel, evs)
+                ||> List.fold (fun m e -> WriterModel.update ctx.Config.MaxLineLength e m)
+        }
+
+let hasWriteBeforeNewlineContent ctx =
+    String.isNotNullOrEmpty ctx.WriterModel.WriteBeforeNewline
+
+let finalizeWriterModel (ctx: Context) =
+    if hasWriteBeforeNewlineContent ctx then
+        writerEvent (Write ctx.WriterModel.WriteBeforeNewline) ctx
+    else
+        ctx
+
+let dump (isSelection: bool) (ctx: Context) =
+    let ctx = finalizeWriterModel ctx
+    let newline = ctx.Config.EndOfLine.NewLineString
+    let sb = System.Text.StringBuilder()
+    let mutable indent = 0
+    let mutable atColumn = 0
+    let mutable writeBeforeNewline = ""
+
+    let doNewline () =
+        indent <- max indent atColumn
+
+        if writeBeforeNewline.Length > 0 then
+            sb.Append(writeBeforeNewline) |> ignore
+            writeBeforeNewline <- ""
+
+        // Trim trailing spaces on the current line
+        while sb.Length > 0 && sb.[sb.Length - 1] = ' ' do
+            sb.Remove(sb.Length - 1, 1) |> ignore
+
+        sb.Append(newline) |> ignore
+        sb.Append(String.replicate indent " ") |> ignore
+
+    for ev in ctx.WriterEvents.ToSeq() do
+        match ev with
+        | Write s
+        | WriteTrivia s -> sb.Append(s) |> ignore
+        | WriteLine
+        | WriteLineBecauseOfTrivia -> doNewline ()
+        | WriteLineInsideStringConst -> sb.Append(newline) |> ignore
+        | WriteLineInsideTrivia -> sb.Append(newline) |> ignore
+        | WriteBeforeNewline s -> writeBeforeNewline <- s
+        | IndentBy x -> indent <- if atColumn >= indent + x then atColumn + x else indent + x
+        | UnIndentBy x -> indent <- max atColumn (indent - x)
+        | SetAtColumn c -> atColumn <- c
+        | RestoreAtColumn c -> atColumn <- c
+        | SetIndent c -> indent <- c
+        | RestoreIndent c -> indent <- c
+        | NodeStart _
+        | NodeEnd _
+        | Start
+        | Placeholder -> ()
+
+    // Trim trailing spaces on the last line
+    while sb.Length > 0 && sb.[sb.Length - 1] = ' ' do
+        sb.Remove(sb.Length - 1, 1) |> ignore
+
+    let code = sb.ToString()
+
+    let code = if isSelection then code else code.TrimStart('\r', '\n')
+
+    {
+        Code = code
+        Cursor = ctx.FormattedCursor
+    }
+
+let dumpEvents (ctx: Context) : WriterEvent array = ctx.WriterEvents.ToSeq() |> Seq.toArray
+
+type Context with
+
+    member x.FinalizeModel = finalizeWriterModel x
+
+    member x.Dump() = (dump false x).Code
+
+/// Walk backward to the first non-empty write on the current line, stopping at the line start.
+let lastWriteEventOnLastLine ctx =
+    let mutable current = ctx.WriterEvents.Tail
+    let mutable result = None
+
+    while not (isNull current) do
+        match current.Event with
+        | WriteLine
+        | WriteLineBecauseOfTrivia
+        | WriteLineInsideStringConst -> current <- null
+        | Write w
+        | WriteTrivia w when (String.length w > 0) ->
+            result <- Some w
+            current <- null
+        | _ -> current <- current.Prev
+
+    result
+
+let lastWriteEventIsNewline ctx =
+    let mutable current = ctx.WriterEvents.Tail
+    let mutable result = false
+
+    while not (isNull current) do
+        match current.Event with
+        | RestoreIndent _
+        | RestoreAtColumn _
+        | UnIndentBy _
+        | EmptyWrite -> current <- current.Prev
+        | WriteLineBecauseOfTrivia
+        | WriteLine ->
+            result <- true
+            current <- null
+        | _ -> current <- null
+
+    result
+
+/// Check if the DLL tail has a complete blank line (two or more newline events)
+/// before any content. Walks backward, skipping indent/restore events.
+let hasBlankLineBeforeLastWrite ctx =
+    let mutable current = ctx.WriterEvents.Tail
+    let mutable newlineCount = 0
+
+    while not (isNull current) do
+        match current.Event with
+        | WriteLine
+        | WriteLineBecauseOfTrivia ->
+            newlineCount <- newlineCount + 1
+            current <- current.Prev
+        | EmptyWrite
+        | IndentBy _
+        | UnIndentBy _
+        | SetIndent _
+        | RestoreIndent _
+        | SetAtColumn _
+        | RestoreAtColumn _ -> current <- current.Prev
+        | _ -> current <- null
+
+    newlineCount > 1
+
+// A few utility functions from https://github.com/fsharp/powerpack/blob/master/src/FSharp.Compiler.CodeDom/generator.fs
+
+let indent (ctx: Context) =
+    // if atColumn is bigger then after indent, then we use atColumn as base for indent
+    writerEvent (IndentBy ctx.Config.IndentSize) ctx
+
+let unindent (ctx: Context) =
+    writerEvent (UnIndentBy ctx.Config.IndentSize) ctx
+
+let atIndentLevel alsoSetIndent level (f: Context -> Context) (ctx: Context) =
+    if level < 0 then
+        invalidArg "level" "The indent level cannot be negative."
+
+    let m = ctx.WriterModel
+    let oldIndent = m.Indent
+    let oldColumn = m.AtColumn
+
+    (writerEvent (SetAtColumn level)
+     >> if alsoSetIndent then writerEvent (SetIndent level) else id
+     >> f
+     >> writerEvent (RestoreAtColumn oldColumn)
+     >> writerEvent (RestoreIndent oldIndent))
+        ctx
+
+let atCurrentColumn (f: _ -> Context) (ctx: Context) = atIndentLevel false ctx.Column f ctx
+
+let atCurrentColumnIndent (f: _ -> Context) (ctx: Context) = atIndentLevel true ctx.Column f ctx
+
+let isConfirmedMultiline (ctx: Context) : bool =
+    match ctx.WriterModel.Mode with
+    | ShortExpression infos -> infos |> List.exists (fun x -> x.ConfirmedMultiline)
+    | _ -> false
+
+let (+>) (ctx: Context -> Context) (f: _ -> Context) x =
+    let y = ctx x
+    if isConfirmedMultiline y then y else f y
+
+let (!-) (str: string) = writerEvent (Write str)
+let writeTrivia (s: string) = writerEvent (WriteTrivia s)
+
+let coli f' (c: 'T seq) f (ctx: Context) =
+    let mutable tryPick = true
+    let mutable st = ctx
+    let mutable i = 0
+    let e = c.GetEnumerator()
+
+    while e.MoveNext() do
+        if tryPick then tryPick <- false else st <- f' st
+
+        st <- f i e.Current st
+        i <- i + 1
+
+    st
+
+let col f' (c: 'T seq) f (ctx: Context) =
+    let mutable tryPick = true
+    let mutable st = ctx
+    let e = c.GetEnumerator()
+
+    while e.MoveNext() do
+        if tryPick then tryPick <- false else st <- f' st
+        st <- f e.Current st
+
+    st
+
+// Similar to col but pass the item of 'T to f' as well
+let colEx f' (c: 'T seq) f (ctx: Context) =
+    let mutable tryPick = true
+    let mutable st = ctx
+    let e = c.GetEnumerator()
+
+    while e.MoveNext() do
+        if tryPick then tryPick <- false else st <- f' e.Current st
+        st <- f e.Current st
+
+    st
+
+let colPost f2 f1 (c: 'T seq) f (ctx: Context) =
+    if Seq.isEmpty c then ctx else f2 (col f1 c f ctx)
+
+let colPre f2 f1 (c: 'T seq) f (ctx: Context) =
+    if Seq.isEmpty c then ctx else col f1 c f (f2 ctx)
+
+let opt (f': Context -> _) o f (ctx: Context) =
+    match o with
+    | Some x -> f' (f x ctx)
+    | None -> ctx
+
+let optSingle f o ctx =
+    match o with
+    | Some x -> f x ctx
+    | None -> ctx
+
+let optPre (f2: _ -> Context) (f1: Context -> _) o f (ctx: Context) =
+    match o with
+    | Some x -> f1 (f x (f2 ctx))
+    | None -> ctx
+
+let getListOrArrayExprSize ctx maxWidth xs =
+    match ctx.Config.ArrayOrListMultilineFormatter with
+    | MultilineFormatterType.CharacterWidth -> Size.CharacterWidth maxWidth
+    | MultilineFormatterType.NumberOfItems -> Size.NumberOfItems(List.length xs, ctx.Config.MaxArrayOrListNumberOfItems)
+
+let getRecordSize ctx fields =
+    match ctx.Config.RecordMultilineFormatter with
+    | MultilineFormatterType.CharacterWidth -> Size.CharacterWidth ctx.Config.MaxRecordWidth
+    | MultilineFormatterType.NumberOfItems -> Size.NumberOfItems(List.length fields, ctx.Config.MaxRecordNumberOfItems)
+
+let ifElse b (f1: Context -> Context) f2 (ctx: Context) = if b then f1 ctx else f2 ctx
+
+let ifElseCtx cond (f1: Context -> Context) f2 (ctx: Context) = if cond ctx then f1 ctx else f2 ctx
+
+let onlyIf cond f ctx = if cond then f ctx else ctx
+
+let onlyIfCtx cond f ctx = if cond ctx then f ctx else ctx
+
+let onlyIfNot cond f ctx = if cond then ctx else f ctx
+
+let rep n (f: Context -> Context) (ctx: Context) =
+    [ 1..n ] |> List.fold (fun c _ -> f c) ctx
+
+// Separator functions
+let sepNone = id
+let sepDot = !-"."
+
+let sepSpace (ctx: Context) =
+    if ctx.WriterModel.IsDummy then
+        (!-" ") ctx
+    else
+
+    match lastWriteEventOnLastLine ctx with
+    | Some w when (String.endsWithOrdinal " " w || String.endsWithOrdinal Environment.NewLine w) -> ctx
+    | None -> ctx
+    | _ -> (!-" ") ctx
+
+// add actual spaces until the target column is reached, regardless of previous content
+// use with care
+let addFixedSpaces (targetColumn: int) (ctx: Context) : Context =
+    let delta = targetColumn - ctx.Column
+    onlyIf (delta > 0) (rep delta (!-" ")) ctx
+
+let sepNln = writerEvent WriteLine
+
+// Use a different WriteLine event to indicate that the newline was introduces due to trivia
+// This is later useful when checking if an expression was multiline when checking for ColMultilineItem
+let sepNlnForTrivia = writerEvent WriteLineBecauseOfTrivia
+
+let sepNlnUnlessLastEventIsNewline (ctx: Context) =
+    if lastWriteEventIsNewline ctx then ctx else sepNln ctx
+
+let sepStar = sepSpace +> !-"* "
+let sepEq = !-" ="
+let sepEqFixed = !-"="
+let sepArrow = !-" -> "
+let sepArrowRev = !-" <- "
+let sepBar = !-"| "
+
+let addSpaceIfSpaceAroundDelimiter (ctx: Context) =
+    onlyIf ctx.Config.SpaceAroundDelimiter sepSpace ctx
+
+let addSpaceIfSpaceAfterComma (ctx: Context) =
+    onlyIf ctx.Config.SpaceAfterComma sepSpace ctx
+
+let sepOpenLFixed = !-"["
+
+let sepCloseLFixed = !-"]"
+
+let sepOpenAnonRecdFixed = !-"{|"
+let sepOpenT = !-"("
+
+let sepCloseT = !-")"
+
+let wordAnd = sepSpace +> !-"and "
+let wordAndFixed = !-"and"
+
+let shortExpressionWithFallback
+    (shortExpression: Context -> Context)
+    fallbackExpression
+    maxWidth
+    startColumn
+    (ctx: Context)
+    =
+    // if the context is already inside a ShortExpression mode and tries to figure out if the expression will go over the page width,
+    // we should try the shortExpression in this case.
+    match ctx.WriterModel.Mode with
+    | ShortExpression infos when
+        (List.exists (fun info -> info.ConfirmedMultiline || info.IsTooLong ctx.Config.MaxLineLength ctx.Column) infos)
+        ->
+        ctx
+    | _ ->
+        // Snapshot the DLL before trying the short expression
+        let snapshot = ctx.WriterEvents.CreateBackupPoint()
+
+        // create special context that will process the writer events slightly different
+        let shortExpressionContext =
+            match startColumn with
+            | Some sc -> ctx.WithShortExpression(maxWidth, sc)
+            | None -> ctx.WithShortExpression(maxWidth)
+
+        let resultContext = shortExpression shortExpressionContext
+
+        match resultContext.WriterModel.Mode with
+        | ShortExpression infos ->
+            // verify the expression is not longer than allowed
+            if
+                List.exists
+                    (fun info ->
+                        info.ConfirmedMultiline
+                        || info.IsTooLong ctx.Config.MaxLineLength resultContext.Column
+                    )
+                    infos
+            then
+                // Restore DLL to before the short attempt, then run fallback
+                ctx.WriterEvents.RollbackTo(snapshot)
+                fallbackExpression ctx
+            else
+                { resultContext with
+                    WriterModel =
+                        { resultContext.WriterModel with
+                            Mode = ctx.WriterModel.Mode
+                        }
+                }
+        | _ ->
+            // you should never hit this branch
+            ctx.WriterEvents.RollbackTo(snapshot)
+            fallbackExpression ctx
+
+let isShortExpression maxWidth (shortExpression: Context -> Context) fallbackExpression (ctx: Context) =
+    shortExpressionWithFallback shortExpression fallbackExpression maxWidth None ctx
+
+let expressionFitsOnRestOfLine expression fallbackExpression (ctx: Context) =
+    shortExpressionWithFallback expression fallbackExpression ctx.Config.MaxLineLength (Some 0) ctx
+
+let isSmallExpression size (smallExpression: Context -> Context) fallbackExpression (ctx: Context) =
+    match size with
+    | CharacterWidth maxWidth -> isShortExpression maxWidth smallExpression fallbackExpression ctx
+    | NumberOfItems(items, maxItems) ->
+
+    if items > maxItems then
+        fallbackExpression ctx
+    else
+        expressionFitsOnRestOfLine smallExpression fallbackExpression ctx
+
+let leadingExpressionResult leadingExpression continuationExpression (ctx: Context) =
+    let lineCountBefore, columnBefore =
+        ctx.WriterModel.LineCount, ctx.WriterModel.Column
+
+    let contextAfterLeading = leadingExpression ctx
+
+    let lineCountAfter, columnAfter =
+        contextAfterLeading.WriterModel.LineCount, contextAfterLeading.WriterModel.Column
+
+    continuationExpression ((lineCountBefore, columnBefore), (lineCountAfter, columnAfter)) contextAfterLeading
+
+let leadingExpressionIsMultiline (leadingExpression: Context -> Context) continuationExpression (ctx: Context) =
+    let snapshotNode = ctx.WriterEvents.CreateBackupPoint()
+
+    let contextAfterLeading = leadingExpression ctx
+
+    // Walk from snapshot forward to check for WriteLine events,
+    // skipping leading trivia/comments/newlines blocks.
+    let startNode =
+        if isNull snapshotNode then
+            ctx.WriterEvents.Head
+        else
+            snapshotNode.Next
+
+    let hasWriteLineEventsAfterExpression =
+        let mutable current = startNode
+        let mutable skipping = true
+        let mutable found = false
+
+        while not (isNull current) && not found do
+            let ev = current.Event
+
+            if skipping then
+                match ev with
+                | CommentOrDefineEvent _
+                | WriteLine
+                | EmptyWrite -> current <- current.Next
+                | _ ->
+                    skipping <- false
+                    // re-check this node
+                    match ev with
+                    | WriteLine -> found <- true
+                    | _ -> current <- current.Next
+            else
+                match ev with
+                | WriteLine -> found <- true
+                | _ -> current <- current.Next
+
+        found
+
+    continuationExpression hasWriteLineEventsAfterExpression contextAfterLeading
+
+let expressionExceedsPageWidth beforeShort afterShort beforeLong afterLong expr (ctx: Context) =
+    // if the context is already inside a ShortExpression mode, we should try the shortExpression in this case.
+    match ctx.WriterModel.Mode with
+    | ShortExpression infos when
+        (List.exists (fun info -> info.ConfirmedMultiline || info.IsTooLong ctx.Config.MaxLineLength ctx.Column) infos)
+        ->
+        ctx
+    | ShortExpression _ ->
+        // if the context is already inside a ShortExpression mode, we should try the shortExpression in this case.
+        (beforeShort +> expr +> afterShort) ctx
+    | _ ->
+        // Snapshot the DLL before trying the short expression
+        let snapshot = ctx.WriterEvents.CreateBackupPoint()
+
+        let shortExpressionContext = ctx.WithShortExpression(ctx.Config.MaxLineLength, 0)
+
+        let resultContext = (beforeShort +> expr +> afterShort) shortExpressionContext
+
+        let fallbackExpression = beforeLong +> expr +> afterLong
+
+        match resultContext.WriterModel.Mode with
+        | ShortExpression infos ->
+            // verify the expression is not longer than allowed
+            if
+                List.exists
+                    (fun info ->
+                        info.ConfirmedMultiline
+                        || info.IsTooLong ctx.Config.MaxLineLength resultContext.Column
+                    )
+                    infos
+            then
+                // Restore DLL to before the short attempt, then run fallback
+                ctx.WriterEvents.RollbackTo(snapshot)
+                fallbackExpression ctx
+            else
+                { resultContext with
+                    WriterModel =
+                        { resultContext.WriterModel with
+                            Mode = ctx.WriterModel.Mode
+                        }
+                }
+        | _ ->
+            // you should never hit this branch
+            ctx.WriterEvents.RollbackTo(snapshot)
+            fallbackExpression ctx
+
+[<Struct>]
+type LongExpressionLayout =
+    | IndentAndUnindent
+    | DoubleIndentAndUnindent
+    | NewlineOnly
+
+/// Walk backward from a node, skipping events that don't represent user-visible content
+/// (restore/unindent/indent events that unwind surrounding contexts, and the node markers of debug mode).
+/// Returns the node where trailing trivia ends, or null if no trivia is found.
+let findTrailingTriviaNewline (events: EventList) : EventNode =
+    let mutable current = events.Tail
+
+    // Skip past trailing non-content events (restore, unindent, indent, newlines from the outer context)
+    while not (isNull current)
+          && (
+              match current.Event with
+              | RestoreIndent _
+              | RestoreAtColumn _
+              | UnIndentBy _
+              | IndentBy _
+              | NodeStart _
+              | NodeEnd _
+              | WriteLine -> true
+              | _ -> false
+          ) do
+        current <- current.Prev
+
+    if isNull current then
+        null
+    else
+
+    match current.Event with
+    | WriteLineBecauseOfTrivia ->
+        let mutable check = current.Prev
+        let mutable foundTrivia = false
+
+        while not (isNull check) && not foundTrivia do
+            match check.Event with
+            // Block comment internals — keep walking
+            | WriteLineInsideTrivia -> check <- check.Prev
+            // An earlier unindentWithTriviaAwareness put its UnIndentBy between the trivia and this newline,
+            // and debug mode marks the nodes that closed in between. A second scope that closes at the same
+            // trivia still finds the newline.
+            | UnIndentBy _
+            | IndentBy _
+            | RestoreIndent _
+            | RestoreAtColumn _
+            | NodeStart _
+            | NodeEnd _ -> check <- check.Prev
+            // Single-line comment, block comment, XML doc, or directive
+            | WriteTrivia _ -> foundTrivia <- true
+            // Hit something that isn't part of trivia — stop
+            | _ -> check <- null
+
+        if foundTrivia then current else null
+    | _ -> null
+
+let indentSepNlnWithTriviaAwareness (ctx: Context) =
+    let indentAmount = ctx.Config.IndentSize
+    let triviaNewline = findTrailingTriviaNewline ctx.WriterEvents
+
+    if isNull triviaNewline then
+        (indent +> sepNln) ctx
+    else
+
+    // Find the start of the trivia block — walk backward from the trivia newline
+    // past trivia events to find where the block begins.
+    let mutable start = triviaNewline
+
+    while not (isNull start.Prev)
+          && (
+              match start.Prev.Event with
+              | WriteTrivia _
+              | WriteLineInsideTrivia
+              | WriteLineBecauseOfTrivia -> true
+              | _ -> false
+          ) do
+        start <- start.Prev
+
+    // Splice IndentBy before the trivia block — the trivia's newline acts as sepNln
+    ctx.WriterEvents.InsertBefore(start, IndentBy indentAmount) |> ignore
+
+    { ctx with
+        WriterModel = WriterModel.update ctx.Config.MaxLineLength (IndentBy indentAmount) ctx.WriterModel
+    }
+
+let unindentWithTriviaAwareness (ctx: Context) =
+    let unindentAmount = ctx.Config.IndentSize
+    let triviaNewline = findTrailingTriviaNewline ctx.WriterEvents
+
+    if isNull triviaNewline then
+        writerEvent (UnIndentBy unindentAmount) ctx
+    else
+
+    // The trivia newline was written inside whatever scopes the content opened, and the events after
+    // it are those scopes unwinding. An `atCurrentColumn` scope clamps the indent to its column and
+    // restores the old indent on exit, so an UnIndentBy spliced in front of the newline would be
+    // undone before the next line is written. See https://github.com/fsprojects/fantomas/issues/3481.
+    // Move the newline past the unwinding events instead, with the UnIndentBy right before it, so the
+    // line after the trivia starts at the unindented column.
+    ctx.WriterEvents.Remove(triviaNewline)
+    ctx.WriterEvents.Append(UnIndentBy unindentAmount) |> ignore
+    ctx.WriterEvents.Append(WriteLineBecauseOfTrivia) |> ignore
+
+    // The model already counted the newline at its old position; only the column it lands on changes.
+    let m: WriterModel =
+        WriterModel.update ctx.Config.MaxLineLength (UnIndentBy unindentAmount) ctx.WriterModel
+
+    let indentAfterNewline: int = max m.Indent m.AtColumn
+
+    { ctx with
+        WriterModel =
+            { m with
+                Indent = indentAfterNewline
+                Column = indentAfterNewline
+            }
+    }
+
+let indentSepNlnUnindent f =
+    indentSepNlnWithTriviaAwareness +> f +> unindentWithTriviaAwareness
+
+let expressionExceedsPageWidthWithLayout (layout: LongExpressionLayout) (addSpaceBefore: bool) expr (ctx: Context) =
+    let beforeShort = if addSpaceBefore then sepSpace else sepNone
+
+    match layout with
+    | NewlineOnly -> expressionExceedsPageWidth beforeShort sepNone sepNln sepNone expr ctx
+    | IndentAndUnindent
+    | DoubleIndentAndUnindent ->
+
+    let beforeLong =
+        match layout with
+        | IndentAndUnindent -> indent +> sepNln
+        | DoubleIndentAndUnindent -> indent +> indent +> sepNln
+        | NewlineOnly -> sepNln
+
+    let afterLong =
+        match layout with
+        | IndentAndUnindent -> unindentWithTriviaAwareness
+        | DoubleIndentAndUnindent -> unindentWithTriviaAwareness +> unindentWithTriviaAwareness
+        | NewlineOnly -> sepNone
+
+    expressionExceedsPageWidth beforeShort sepNone beforeLong afterLong expr ctx
+
+let autoIndentAndNlnIfExpressionExceedsPageWidth expr (ctx: Context) =
+    expressionExceedsPageWidthWithLayout IndentAndUnindent false expr ctx
+
+let sepSpaceOrIndentAndNlnIfExpressionExceedsPageWidth expr (ctx: Context) =
+    expressionExceedsPageWidthWithLayout IndentAndUnindent true expr ctx
+
+let sepSpaceOrDoubleIndentAndNlnIfExpressionExceedsPageWidth expr (ctx: Context) =
+    expressionExceedsPageWidthWithLayout DoubleIndentAndUnindent true expr ctx
+
+let isStroustrupStyleExpr (config: FormatConfig) (e: Expr) =
+    let isStroustrupEnabled = config.MultilineBracketStyle = Stroustrup
+
+    match e with
+    | Expr.Record _
+    | Expr.AnonStructRecord _
+    | Expr.ObjExpr _
+    | Expr.ArrayOrList _ -> isStroustrupEnabled
+    | Expr.NamedComputation _ -> not config.NewlineBeforeMultilineComputationExpression
+    | _ -> false
+
+let isStroustrupStyleType (config: FormatConfig) (t: Type) =
+    let isStroustrupEnabled = config.MultilineBracketStyle = Stroustrup
+
+    match t with
+    | Type.AnonRecord _ when isStroustrupEnabled -> true
+    | _ -> false
+
+let canSafelyUseStroustrup (node: Node) (ctx: Context) =
+    not node.HasContentBefore && not (hasWriteBeforeNewlineContent ctx)
+
+let sepSpaceOrIndentAndNlnIfExceedsPageWidthUnlessStroustrup isStroustrup f (node: Node) (ctx: Context) =
+    if isStroustrup && canSafelyUseStroustrup node ctx then
+        (sepSpace +> f) ctx
+    else
+        sepSpaceOrIndentAndNlnIfExpressionExceedsPageWidth f ctx
+
+let sepSpaceOrIndentAndNlnIfExpressionExceedsPageWidthUnlessStroustrup f (expr: Expr) (ctx: Context) =
+    sepSpaceOrIndentAndNlnIfExceedsPageWidthUnlessStroustrup
+        (isStroustrupStyleExpr ctx.Config expr)
+        (f expr)
+        (Expr.Node expr)
+        ctx
+
+let sepSpaceOrIndentAndNlnIfTypeExceedsPageWidthUnlessStroustrup f (t: Type) (ctx: Context) =
+    sepSpaceOrIndentAndNlnIfExceedsPageWidthUnlessStroustrup
+        (isStroustrupStyleType ctx.Config t)
+        (f t)
+        (Type.Node t)
+        ctx
+
+let autoNlnIfExpressionExceedsPageWidth expr (ctx: Context) =
+    expressionExceedsPageWidthWithLayout NewlineOnly false expr ctx
+
+let autoParenthesisIfExpressionExceedsPageWidth expr (ctx: Context) =
+    expressionFitsOnRestOfLine expr (sepOpenT +> expr +> sepCloseT) ctx
+
+let futureNlnCheckMem (f, ctx: Context) =
+    if ctx.WriterModel.IsDummy then
+        (false, false)
+    else
+
+    let dummyResult = ctx.WithDummy(f, keepPageWidth = true)
+    let isMultiline = dummyResult.WriterModel.LineCount > ctx.WriterModel.LineCount
+    let isLong = dummyResult.Column > ctx.Config.MaxLineLength
+    isMultiline, isLong
+
+let futureNlnCheck f (ctx: Context) =
+    let isMultiLine, isLong = futureNlnCheckMem (f, ctx)
+    isMultiLine || isLong
+
+let indentPast (column: int) (f: Context -> Context) (ctx: Context) : Context =
+    // Nothing is written yet, so this is where a fresh line lands if `f` indents once and
+    // breaks right here.
+    let freshLineColumn: int =
+        ctx.WithDummy(indent +> sepNln, keepPageWidth = true).Column
+
+    if freshLineColumn > column then
+        f ctx
+    else
+
+    // One whole level at a time, so every column stays a multiple of the indent size.
+    let levels: int = (column - freshLineColumn) / ctx.Config.IndentSize + 1
+
+    (rep levels indent +> f +> rep levels unindent) ctx
+
+let exceedsWidth maxWidth f (ctx: Context) =
+    let dummyResult = ctx.WithDummy(f, keepPageWidth = true)
+
+    dummyResult.WriterModel.LineCount > ctx.WriterModel.LineCount
+    || (dummyResult.Column - ctx.Column) > maxWidth
+    || ctx.Column > ctx.Config.MaxLineLength
+
+/// Similar to col, skip auto newline for index 0
+let colAutoNlnSkip0i f' (c: 'T seq) f (ctx: Context) =
+    coli
+        f'
+        c
+        (fun i c ->
+            if i = 0 then
+                f i c
+            else
+                autoNlnIfExpressionExceedsPageWidth (f i c)
+        )
+        ctx
+
+let colAutoNlnSkip0 f' c f = colAutoNlnSkip0i f' c (fun _ -> f)
+
+let sepSpaceBeforeClassConstructor ctx =
+    if ctx.Config.SpaceBeforeClassConstructor then
+        sepSpace ctx
+    else
+        ctx
+
+let sepColon (ctx: Context) =
+    let defaultExpr = if ctx.Config.SpaceBeforeColon then !-" : " else !-": "
+
+    if ctx.WriterModel.IsDummy then
+        defaultExpr ctx
+    else
+
+    match lastWriteEventOnLastLine ctx with
+    | Some w when String.endsWithOrdinal " " w -> !- ": " ctx
+    | None -> !- ": " ctx
+    | _ -> defaultExpr ctx
+
+let sepColonFixed = !-":"
+
+let sepColonWithSpacesFixed = !-" : "
+
+let sepCommaFixed: Context -> Context = !-","
+
+let sepComma (ctx: Context) =
+    if ctx.Config.SpaceAfterComma then
+        !- ", " ctx
+    else
+        !- "," ctx
+
+let sepSemi (ctx: Context) =
+    let {
+            Config = {
+                         SpaceBeforeSemicolon = before
+                         SpaceAfterSemicolon = after
+                     }
+        } =
+        ctx
+
+    let separator: Context -> Context =
+        match before, after with
+        | false, false -> !-";"
+        | true, false -> !-" ;"
+        | false, true -> !-"; "
+        | true, true -> !-" ; "
+
+    separator ctx
+
+let ifAlignOrStroustrupBrackets f g =
+    ifElseCtx
+        (fun ctx ->
+            match ctx.Config.MultilineBracketStyle with
+            | Aligned
+            | Stroustrup -> true
+            | Cramped -> false
+        )
+        f
+        g
+
+let sepNlnWhenWriteBeforeNewlineNotEmptyOr fallback (ctx: Context) =
+    if hasWriteBeforeNewlineContent ctx then
+        sepNln ctx
+    else
+        fallback ctx
+
+let sepNlnWhenWriteBeforeNewlineNotEmpty =
+    sepNlnWhenWriteBeforeNewlineNotEmptyOr sepNone
+
+let sepSpaceUnlessWriteBeforeNewlineNotEmpty (ctx: Context) =
+    if hasWriteBeforeNewlineContent ctx then
+        ctx
+    else
+        sepSpace ctx
+
+let autoIndentAndNlnWhenWriteBeforeNewlineNotEmpty (f: Context -> Context) (ctx: Context) =
+    if hasWriteBeforeNewlineContent ctx then
+        indentSepNlnUnindent f ctx
+    else
+        f ctx
+
+let addParenIfAutoNln expr f =
+    let hasParenthesis =
+        match expr with
+        | Expr.Paren _
+        | Expr.ParenLambda _
+        | Expr.ParenILEmbedded _
+        | Expr.ParenFunctionNameWithStar _
+        | Expr.Constant(Constant.Unit _) -> true
+        | _ -> false
+
+    let expr = f expr
+    expressionFitsOnRestOfLine expr (ifElse hasParenthesis (sepOpenT +> expr +> sepCloseT) expr)
+
+let indentSepNlnUnindentUnlessStroustrup f (e: Expr) (ctx: Context) =
+    let shouldUseStroustrup =
+        let isArrayOrListWithHashDirectiveBeforeClosingBracket () =
+            match e with
+            | Expr.ArrayOrList node ->
+                node.Closing.ContentBefore
+                |> Seq.forall (fun x ->
+                    match x.Content with
+                    | TriviaContent.Directive _ -> false
+                    | _ -> true
+                )
+            | _ -> true
+
+        let namedComputationNameFitsOnOneLine () =
+            // When NewlineBeforeMultilineComputationExpression = false, the CE is treated as Stroustrup-style:
+            // the opening brace stays on the same line as the name expression.
+            // But if the name expression itself is multiline (e.g. its argument list wraps), the closing
+            // ')' lands at the global indent level (e.g. column 0), violating the offside rule for the
+            // surrounding let binding.  In that case we must fall back to indent + newline. See #3155.
+            match e with
+            | Expr.NamedComputation node -> not (futureNlnCheck (f node.Name) ctx)
+            | _ -> true
+
+        isStroustrupStyleExpr ctx.Config e
+        && canSafelyUseStroustrup (Expr.Node e) ctx
+        && isArrayOrListWithHashDirectiveBeforeClosingBracket ()
+        && namedComputationNameFitsOnOneLine ()
+
+    if shouldUseStroustrup then
+        f e ctx
+    else
+        indentSepNlnUnindent (f e) ctx
+
+let autoIndentAndNlnTypeUnlessStroustrup f (t: Type) (ctx: Context) =
+    let shouldUseStroustrup =
+        isStroustrupStyleType ctx.Config t && canSafelyUseStroustrup (Type.Node t) ctx
+
+    if shouldUseStroustrup then
+        f t ctx
+    else
+        autoIndentAndNlnIfExpressionExceedsPageWidth (f t) ctx
+
+let autoIndentAndNlnIfExpressionExceedsPageWidthUnlessStroustrup f (e: Expr) (ctx: Context) =
+    let isStroustrup =
+        isStroustrupStyleExpr ctx.Config e && canSafelyUseStroustrup (Expr.Node e) ctx
+
+    if isStroustrup then
+        f e ctx
+    else
+        autoIndentAndNlnIfExpressionExceedsPageWidth (f e) ctx
+
+[<NoComparison; NoEquality>]
+type ColMultilineItem =
+    | ColMultilineItem of
+        // current expression
+        expr: (Context -> Context) *
+        // sepNln of current item
+        sepNln: (Context -> Context)
+
+[<NoComparison>]
+type ColMultilineItemsState =
+    {
+        LastBlockMultiline: bool
+        Context: Context
+    }
+
+/// Checks if the events of an expression produces multiple lines of by user code.
+/// Leading or trailing trivia will not be counted as such.
+let isMultilineItem (expr: Context -> Context) (ctx: Context) : bool * Context =
+    let snapshotNode = ctx.WriterEvents.CreateBackupPoint()
+    let nextCtx = expr ctx
+
+    // Walk from snapshot forward, skipping leading trivia/newlines,
+    // then check for WriteLine/WriteLineInsideStringConst.
+    let startNode =
+        if isNull snapshotNode then
+            ctx.WriterEvents.Head
+        else
+            snapshotNode.Next
+
+    let isExpressionMultiline =
+        let mutable current = startNode
+        let mutable skipping = true
+        let mutable found = false
+
+        while not (isNull current) && not found do
+            let ev = current.Event
+
+            if skipping then
+                match ev with
+                | CommentOrDefineEvent _
+                | WriteLine
+                | WriteLineBecauseOfTrivia -> current <- current.Next
+                | _ -> skipping <- false
+            else
+                match current.Event with
+                | WriteLine
+                | WriteLineInsideStringConst -> found <- true
+                | _ -> current <- current.Next
+
+        found
+
+    isExpressionMultiline, nextCtx
+
+let colWithNlnWhenItemIsMultiline (items: ColMultilineItem list) (ctx: Context) : Context =
+    match items with
+    | [] -> ctx
+    | [ (ColMultilineItem(expr, _)) ] -> expr ctx
+    | ColMultilineItem(initialExpr, _) :: items ->
+
+    let result =
+        // The first item can be written as is.
+        let initialIsMultiline, initialCtx = isMultilineItem initialExpr ctx
+
+        let itemsState =
+            {
+                Context = initialCtx
+                LastBlockMultiline = initialIsMultiline
+            }
+
+        let rec loop (acc: ColMultilineItemsState) (items: ColMultilineItem list) =
+            match items with
+            | [] -> acc.Context
+            | ColMultilineItem(expr, sepNlnItem) :: rest ->
+
+            // Optimistic path: assume the item (or its predecessor) is multiline,
+            // so emit an extra blank line separator before running the expression.
+            // If both turn out to be single-line, we roll back and replay without the extra blank line.
+            let backupPoint = acc.Context.WriterEvents.CreateBackupPoint()
+
+            let ctxAfterNln =
+                (ifElseCtx
+                    hasBlankLineBeforeLastWrite
+                    sepNone // don't add extra newline if there already is a full blank line at the end of the stream.
+                    sepNlnUnlessLastEventIsNewline // trivia may have already produced a newline
+                 +> sepNlnItem)
+                    acc.Context
+
+            let isMultiline, nextCtx = isMultilineItem expr ctxAfterNln
+
+            let nextCtx =
+                if not isMultiline && not acc.LastBlockMultiline then
+                    // Both the previous and current items are single-line.
+                    // The optimistic blank line was wrong — roll back those events
+                    // and replay with just the regular separator.
+                    acc.Context.WriterEvents.RollbackTo(backupPoint)
+                    (sepNlnUnlessLastEventIsNewline +> expr) acc.Context
+                else
+                    nextCtx
+
+            loop
+                {
+                    Context = nextCtx
+                    LastBlockMultiline = isMultiline
+                }
+                rest
+
+        loop itemsState items
+
+    result
+
+let colWithNlnWhenItemIsMultilineUsingConfig (items: ColMultilineItem list) (ctx: Context) =
+    if ctx.Config.BlankLinesAroundNestedMultilineExpressions then
+        colWithNlnWhenItemIsMultiline items ctx
+    else
+        col sepNlnUnlessLastEventIsNewline items (fun (ColMultilineItem(expr, _)) -> expr) ctx

@@ -1,0 +1,48 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Calque.Core</AssemblyName>
+    <RootNamespace>Calque.Core</RootNamespace>
+    <IsPackable>true</IsPackable>
+    <Tailcalls>true</Tailcalls>
+    <ProduceReferenceAssembly>true</ProduceReferenceAssembly>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="RangeHelpers.fsi" />
+    <Compile Include="RangeHelpers.fs" />
+    <Compile Include="Utils.fsi" />
+    <Compile Include="Utils.fs" />
+    <Compile Include="Exceptions.fs" />
+    <Compile Include="FormatConfig.fs" />
+    <Compile Include="SyntaxOak.fs" />
+    <Compile Include="ASTTransformer.fsi" />
+    <Compile Include="ASTTransformer.fs" />
+    <Compile Include="Queue.fs" />
+    <Compile Include="Trivia.fsi" />
+    <Compile Include="Trivia.fs" />
+    <Compile Include="Defines.fsi" />
+    <Compile Include="Defines.fs" />
+    <Compile Include="CodeFormatterTypes.fs" />
+    <Compile Include="WriterEvent.fs" />
+    <Compile Include="EventList.fs" />
+    <Compile Include="Context.fsi" />
+    <Compile Include="Context.fs" />
+    <Compile Include="CodePrinter.fsi" />
+    <Compile Include="CodePrinter.fs" />
+    <Compile Include="MultipleDefineCombinations.fsi" />
+    <Compile Include="MultipleDefineCombinations.fs" />
+    <Compile Include="CodeFormatterImpl.fsi" />
+    <Compile Include="CodeFormatterImpl.fs" />
+    <Compile Include="SourceDialect.fs" />
+    <Compile Include="CodeFormatter.fsi" />
+    <Compile Include="CodeFormatter.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Calque.Syntax\Calque.Syntax.fsproj" />
+  </ItemGroup>
+</Project>

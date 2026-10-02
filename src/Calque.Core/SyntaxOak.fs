@@ -1,0 +1,3498 @@
+module rec Calque.Core.SyntaxOak
+
+open System.Collections.Generic
+open System.Text
+open Calque.Syntax.Text
+
+/// The kind of non-code content that can be attached to a node as trivia.
+/// Single-line and line-after-source-code comments carry their text; block comments
+/// also record whether blank lines should surround them. <c>Directive</c> covers
+/// preprocessor directives and <c>Cursor</c> is used by editor tooling to track the
+/// caret position during formatting.
+type TriviaContent =
+    | CommentOnSingleLine of string
+    /// A single-line comment preceded by one or more blank lines in the source.
+    /// Unlike a plain CommentOnSingleLine + separate Newline trivia, this combined case
+    /// ensures the blank lines and comment are assigned to the same Oak node during
+    /// trivia assignment. Without this, the Newline (at column 0) and the indented comment
+    /// (at column > 0) would be assigned to different nodes via different matching paths,
+    /// causing the blank line to be lost or misplaced after formatting.
+    | CommentOnSingleLineWithLeadingNewlines of newlines: int * comment: string
+    | LineCommentAfterSourceCode of comment: string
+    | BlockComment of comment: string * newlineBefore: bool * newlineAfter: bool
+    | Newline
+    | Directive of string
+    | Cursor
+
+/// A node carrying trivia content (comment, blank line, directive, or cursor) and its source range.
+/// Trivia nodes are attached to <see cref="Node"/> instances as <c>ContentBefore</c> or <c>ContentAfter</c>
+/// and are emitted by the code printer around the owning node's output.
+type TriviaNode(content: TriviaContent, range: range) =
+    member val Content = content
+    member val Range = range
+
+    override x.ToString() =
+        let rangeStr = $"range: %A{x.Range}"
+
+        match x.Content with
+        | CommentOnSingleLine s -> $"CommentOnSingleLine(%s{rangeStr}, \"%s{s}\")"
+        | CommentOnSingleLineWithLeadingNewlines(n, s) ->
+            $"CommentOnSingleLineWithLeadingNewlines(%s{rangeStr}, newlines: %d{n}, \"%s{s}\")"
+        | LineCommentAfterSourceCode s -> $"LineCommentAfterSourceCode(%s{rangeStr}, \"%s{s}\")"
+        | BlockComment(s, before, after) ->
+            $"BlockComment(%s{rangeStr}, \"%s{s}\", newlineBefore: %b{before}, newlineAfter: %b{after})"
+        | Newline -> $"Newline(%s{rangeStr})"
+        | Directive s -> $"Directive(%s{rangeStr}, \"%s{s}\")"
+        | Cursor -> $"Cursor(%s{rangeStr})"
+
+/// The core interface implemented by every node in the Oak intermediate representation.
+/// Each node carries trivia (comments, blank lines, directives) that were attached to
+/// it during the AST → Oak transformation, together with its source range and child nodes.
+/// The printer reads <c>ContentBefore</c> / <c>ContentAfter</c> when emitting each node
+/// so that all non-code content is reproduced in the output.
+[<Interface>]
+type Node =
+    abstract ContentBefore: TriviaNode seq
+    /// True when there is trivia before this node that should influence layout.
+    /// <c>Cursor</c> trivia is excluded on purpose: the caret position must never change the
+    /// formatted output. Use this to decide indentation, newlines and spacing.
+    /// This is NOT the negation of <c>HasAnyContentBefore</c> — see that member.
+    abstract HasContentBefore: bool
+    abstract ContentAfter: TriviaNode seq
+    /// See <c>HasContentBefore</c>.
+    abstract HasContentAfter: bool
+    /// True when there is any trivia before this node at all, <c>Cursor</c> included.
+    /// Use this to decide whether generating trivia can be skipped entirely: a node whose only
+    /// trivia is a <c>Cursor</c> still has to be generated, so <c>HasContentBefore</c> is the
+    /// wrong test for that and would silently drop the cursor. O(1), where <c>HasContentBefore</c>
+    /// enumerates.
+    abstract HasAnyContentBefore: bool
+    /// See <c>HasAnyContentBefore</c>.
+    abstract HasAnyContentAfter: bool
+    abstract Range: range
+    abstract Children: Node array
+    abstract AddBefore: triviaNode: TriviaNode -> unit
+    abstract AddAfter: triviaNode: TriviaNode -> unit
+
+/// True when the queue holds trivia that should influence layout, i.e. anything other than a
+/// <c>Cursor</c>. Most nodes carry no trivia at all, so the O(1) count is tested first; beyond that
+/// the queue's struct enumerator is walked directly, because going through <c>Seq</c> boxes it
+/// (measured: 40 bytes and roughly 2x the time per call).
+let private hasLayoutAffectingTrivia (nodes: Queue<TriviaNode>) =
+    if isNull nodes || nodes.Count = 0 then
+        false
+    else
+
+    let mutable found = false
+    let mutable e = nodes.GetEnumerator()
+
+    while not found && e.MoveNext() do
+        match e.Current.Content with
+        | Cursor -> ()
+        | _ -> found <- true
+
+    found
+
+/// Base implementation of <see cref="Node"/> shared by all concrete Oak node types.
+/// Manages the mutable trivia queues (<c>ContentBefore</c> / <c>ContentAfter</c>).
+/// Concrete node types inherit from this class and supply their <c>Children</c> override.
+[<AbstractClass>]
+type NodeBase(range: range) =
+    // Created on the first trivia added: nearly every node has none, and there are a lot of nodes.
+    let mutable nodesBefore: Queue<TriviaNode> = null
+    let mutable nodesAfter: Queue<TriviaNode> = null
+
+    member _.ContentBefore: TriviaNode seq =
+        if isNull nodesBefore then Seq.empty else nodesBefore
+
+    member _.HasContentBefore = hasLayoutAffectingTrivia nodesBefore
+
+    member _.ContentAfter: TriviaNode seq =
+        if isNull nodesAfter then Seq.empty else nodesAfter
+
+    member _.HasContentAfter = hasLayoutAffectingTrivia nodesAfter
+
+    member _.HasAnyContentBefore = not (isNull nodesBefore) && nodesBefore.Count > 0
+    member _.HasAnyContentAfter = not (isNull nodesAfter) && nodesAfter.Count > 0
+
+    member _.Range = range
+
+    member _.AddBefore triviaNode =
+        if isNull nodesBefore then
+            nodesBefore <- Queue<TriviaNode>()
+
+        nodesBefore.Enqueue triviaNode
+
+    member _.AddAfter triviaNode =
+        if isNull nodesAfter then
+            nodesAfter <- Queue<TriviaNode>()
+
+        nodesAfter.Enqueue triviaNode
+
+    abstract member Children: Node array
+
+    member private x.AppendToStringWithIndent(sb: StringBuilder, depth: int) =
+        let indent = String.replicate depth "  "
+        let contentIndent = String.replicate (depth + 1) "  "
+
+        sb.Append(indent).Append(x.GetType().Name).Append("(").Append(x.Range) |> ignore
+
+        let hasContentBefore = not (Seq.isEmpty x.ContentBefore)
+        let hasChildren = not (Array.isEmpty x.Children)
+        let hasContentAfter = not (Seq.isEmpty x.ContentAfter)
+        let hasContent = hasContentBefore || hasChildren || hasContentAfter
+
+        if not hasContent then
+            sb.Append(")") |> ignore
+        else
+
+        sb.AppendLine() |> ignore
+
+        if hasContentBefore then
+            for tn in x.ContentBefore do
+                sb.Append(contentIndent).Append("▼ ").Append(tn.ToString()).AppendLine()
+                |> ignore
+
+        if hasChildren then
+            for n in x.Children do
+                match n with
+                | :? SingleTextNode as stn ->
+                    for tn in stn.ContentBefore do
+                        sb.Append(contentIndent).Append("▼ ").Append(tn.ToString()).AppendLine()
+                        |> ignore
+
+                    sb.Append(contentIndent).Append(stn.ToString()).AppendLine() |> ignore
+
+                    for tn in stn.ContentAfter do
+                        sb.Append(contentIndent).Append("▲ ").Append(tn.ToString()).AppendLine()
+                        |> ignore
+                | :? NodeBase as nb ->
+                    nb.AppendToStringWithIndent(sb, depth + 1)
+                    sb.AppendLine() |> ignore
+                | _ -> sb.Append(contentIndent).Append(n.ToString()).AppendLine() |> ignore
+
+        if hasContentAfter then
+            for tn in x.ContentAfter do
+                sb.Append(contentIndent).Append("▲ ").Append(tn.ToString()).AppendLine()
+                |> ignore
+
+        sb.Append(indent).Append(")") |> ignore
+
+    member private x.ToStringWithIndent(depth: int) =
+        let sb = StringBuilder()
+        x.AppendToStringWithIndent(sb, depth)
+        sb.ToString()
+
+    override x.ToString() = x.ToStringWithIndent(0)
+
+    interface Node with
+        member x.ContentBefore = x.ContentBefore
+        member x.HasContentBefore = x.HasContentBefore
+        member x.ContentAfter = x.ContentAfter
+        member x.HasContentAfter = x.HasContentAfter
+        member x.HasAnyContentBefore = x.HasAnyContentBefore
+        member x.HasAnyContentAfter = x.HasAnyContentAfter
+        member x.Range = x.Range
+        member x.AddBefore triviaNode = x.AddBefore triviaNode
+        member x.AddAfter triviaNode = x.AddAfter triviaNode
+        member x.Children = x.Children
+
+/// A leaf node holding a plain string value with no sub-nodes (e.g. a verbatim string token or source text fragment).
+type StringNode(content: string, range: range) =
+    inherit NodeBase(range)
+    member val Content = content
+    override val Children = Array.empty
+
+let noa<'n when 'n :> Node> (n: 'n option) =
+    match n with
+    | None -> Array.empty
+    | Some n -> [| n :> Node |]
+
+let nodes<'n when 'n :> Node> (ns: 'n seq) = Seq.cast<Node> ns
+
+let nodeRange (n: Node) = n.Range
+
+let combineRanges (ranges: range seq) =
+    if Seq.isEmpty ranges then
+        Range.range0
+    else
+        Seq.reduce Range.unionRanges ranges
+
+/// A single element of a dotted identifier path, either an identifier token or a dot separator.
+/// <c>KnownDot</c> carries the source range of the <c>.</c> when it is present in the source;
+/// <c>UnknownDot</c> is used as a synthetic separator when the original range is unavailable.
+[<RequireQualifiedAccess; NoComparison>]
+type IdentifierOrDot =
+    | Ident of SingleTextNode
+    | KnownDot of SingleTextNode
+    | UnknownDot
+
+    member x.Range =
+        match x with
+        | Ident n -> Some n.Range
+        | KnownDot n -> Some n.Range
+        | UnknownDot -> None
+
+/// Example: `A.B.C` or `A` — a qualified identifier (sequence of idents and dots).
+/// Used wherever a dotted name appears: module names, type names, open statements, etc.
+type IdentListNode(content: IdentifierOrDot list, range) =
+    inherit NodeBase(range)
+    member val IsEmpty = content.IsEmpty
+    member val Content = content
+    static member Empty = IdentListNode(List.empty, Range.range0)
+
+    override x.Children =
+        x.Content
+        |> List.choose (
+            function
+            | IdentifierOrDot.Ident n -> Some(n :> Node)
+            | IdentifierOrDot.KnownDot n -> Some(n :> Node)
+            | _ -> None
+        )
+        |> Array.ofList
+
+/// The most fundamental leaf node — a single token of source text (keyword, operator, identifier, punctuation, etc.).
+/// Examples: `let`, `=`, `->`, `(`, `myVar`.
+type SingleTextNode(idText: string, range: range) =
+    inherit NodeBase(range)
+    let mutable cursor: pos option = None
+    member val Text = idText
+    override val Children = Array.empty
+
+    /// Of all nodes, only a `SingleTextNode` holds the editor's cursor, see `Trivia.insertCursor`.
+    member _.AddCursor(position: pos) = cursor <- Some position
+
+    member _.TryGetCursor: pos option = cursor
+
+    override x.ToString() =
+        $"SingleTextNode(%A{x.Range}, \"%s{x.Text}\")"
+
+/// A node holding two or more adjacent text tokens that logically form one keyword or modifier sequence.
+/// Example: `static member` (two tokens), `abstract default` (access + keyword).
+type MultipleTextsNode(content: SingleTextNode list, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield! nodes content |]
+    member val Content = content
+
+/// Example: `/// Summary line.\n/// More detail.` — an XML documentation comment block.
+/// Each element of <c>Lines</c> is one raw source line of the doc comment.
+type XmlDocNode(lines: string array, range) =
+
+    inherit NodeBase(range)
+    override val Children = Array.empty
+    member val Lines = lines
+
+type Oak(parsedHashDirectives: ParsedHashDirectiveNode list, modulesOrNamespaces: ModuleOrNamespaceNode list, m: range)
+    =
+    inherit NodeBase(m)
+
+    member val ParsedHashDirectives = parsedHashDirectives
+    member val ModulesOrNamespaces = modulesOrNamespaces
+
+    override val Children: Node array = [| yield! nodes parsedHashDirectives; yield! nodes modulesOrNamespaces |]
+
+/// Example: `#r "nuget: Newtonsoft.Json"` or `#load "Utils.fs"` — a hash directive at the file level.
+/// <c>Ident</c> is the directive keyword (e.g. `r`, `load`, `nowarn`); <c>Args</c> are its arguments.
+type ParsedHashDirectiveNode(ident: string, args: Choice<SingleTextNode, IdentListNode> list, range) =
+    inherit NodeBase(range)
+    member val Ident = ident
+    member val Args = args
+
+    override val Children: Node array =
+        [|
+            for arg in args do
+                match arg with
+                | Choice1Of2(node) -> node
+                | Choice2Of2(node) -> node
+        |]
+
+/// The header of a module or namespace declaration: optional doc, attributes, leading keyword (`module`/`namespace`),
+/// optional accessibility, optional recursive flag, and the qualified name.
+/// Example: `module rec MyApp.Utils` or `namespace global`.
+type ModuleOrNamespaceHeaderNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode,
+        accessibility: SingleTextNode option,
+        isRecursive: bool,
+        name: IdentListNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield leadingKeyword
+            yield! noa accessibility
+            yield! noa name
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val Accessibility = accessibility
+    member val IsRecursive = isRecursive
+    member val Name = name
+
+/// A top-level module or namespace containing an optional header and a list of declarations.
+/// Corresponds to a `SynModuleOrNamespace` in the FCS untyped AST.
+type ModuleOrNamespaceNode(header: ModuleOrNamespaceHeaderNode option, decls: ModuleDecl list, range) =
+    inherit NodeBase(range)
+    member val Declarations = decls
+    member val IsNamed = Option.isSome header
+
+    override val Children: Node array = [| yield! noa header; yield! List.map ModuleDecl.Node decls |]
+    member val Header = header
+
+/// Example: `int -> string -> bool` — a function type with one or more parameters and a return type.
+/// Each parameter is paired with its arrow token; the final element is the return type.
+type TypeFunsNode(parameters: (Type * SingleTextNode) list, returnType: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! nodes (List.collect (fun (t, arrow) -> [ yield Type.Node t; yield (arrow :> Node) ]) parameters)
+            yield Type.Node returnType
+        |]
+
+    /// Type + arrow
+    member val Parameters = parameters
+    member val ReturnType = returnType
+
+/// Example: `int * string * bool` — a tuple type. Path interleaves the component types with `*` separators.
+type TypeTupleNode(path: Choice<Type, SingleTextNode> list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield!
+                List.map
+                    (function
+                    | Choice1Of2 t -> Type.Node t
+                    | Choice2Of2 n -> n :> Node)
+                    path
+        |]
+
+    member val Path = path
+
+/// Example: `#IDisposable` — a flexible/hash constraint type that matches any subtype.
+type TypeHashConstraintNode(hash: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield hash; yield Type.Node t |]
+    member val Hash = hash
+    member val Type = t
+
+/// Example: `m^2` — a measure type raised to a rational power (used in units of measure).
+type TypeMeasurePowerNode(baseMeasure: Type, exponent: RationalConstNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Type.Node baseMeasure |]
+    member val BaseMeasure = baseMeasure
+    member val Exponent = exponent
+
+/// Example: `const 42` — a static constant expression used as a type argument (e.g. in inline F# code or SRTP).
+type TypeStaticConstantExprNode(constNode: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield constNode; yield Expr.Node expr |]
+    member val Const = constNode
+    member val Expr = expr
+
+/// Example: `N=3` — a named static constant type, pairing an identifier type with a value type (e.g. in SRTP constraints).
+type TypeStaticConstantNamedNode(identifier: Type, value: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Type.Node identifier; yield Type.Node value |]
+    member val Identifier = identifier
+    member val Value = value
+
+/// Example: `int[]` (rank 1) or `int[,]` (rank 2) — an array type with a base element type and a rank.
+type TypeArrayNode(t: Type, rank: int, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Type.Node t |]
+    member val Type = t
+    member val Rank = rank
+
+/// Example: `int list` or `string option` — a postfix type application where the type argument precedes the type name.
+type TypeAppPostFixNode(first: Type, last: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Type.Node first; yield Type.Node last |]
+    member val First = first
+    member val Last = last
+
+/// Example: `List<int>` or `Dictionary<string, int>` — a prefix type application with angle-bracket type arguments.
+type TypeAppPrefixNode
+    (
+        identifier: Type,
+        postIdentifier: IdentListNode option,
+        lessThan: SingleTextNode,
+        arguments: Type list,
+        greaterThan: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Type.Node identifier
+            yield! noa postIdentifier
+            yield lessThan
+            yield! (List.map Type.Node arguments)
+            yield greaterThan
+        |]
+
+    member val Identifier = identifier
+    member val PostIdentifier = postIdentifier
+    member val GreaterThan = greaterThan
+    member val Arguments = arguments
+    member val LessThen = lessThan
+
+/// Example: `struct (int * string)` — a struct tuple type, distinguishable from a reference tuple by the `struct` keyword.
+type TypeStructTupleNode
+    (keyword: SingleTextNode, path: Choice<Type, SingleTextNode> list, closingParen: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield keyword
+            yield!
+                List.map
+                    (function
+                    | Choice1Of2 t -> Type.Node t
+                    | Choice2Of2 n -> n :> Node)
+                    path
+            yield closingParen
+        |]
+
+    member val Keyword = keyword
+    member val Path = path
+    member val ClosingParen = closingParen
+
+/// Example: `'T when 'T : equality` — a type paired with one or more type constraints that apply globally.
+type TypeWithGlobalConstraintsNode(t: Type, constraints: TypeConstraint list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Type.Node t; yield! List.map TypeConstraint.Node constraints |]
+
+    member val Type = t
+    member val TypeConstraints = constraints
+
+/// Example: `{| Name: string; Age: int |}` or `struct {| X: float |}` — an anonymous record type.
+type TypeAnonRecordNode
+    (
+        structNode: SingleTextNode option,
+        openingToken: SingleTextNode option,
+        fields: (SingleTextNode * Type) list,
+        closingToken: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa structNode
+            yield! noa openingToken
+            yield! (fields |> List.collect (fun (i, t) -> [ yield (i :> Node); yield Type.Node t ]))
+            yield closingToken
+        |]
+
+    member val Struct = structNode
+    member val Opening = openingToken
+    member val Fields = fields
+    member val Closing = closingToken
+
+/// Example: `(int -> string)` — a parenthesised type, used to clarify precedence or wrap a type in parens.
+type TypeParenNode(openingParen: SingleTextNode, t: Type, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield openingParen; yield Type.Node t; yield closingParen |]
+    member val OpeningParen = openingParen
+    member val Type = t
+    member val ClosingParen = closingParen
+
+/// Example: `?x: int` or `[<Optional>] name: string` — a parameter type in a signature, optionally with attributes and an identifier label.
+type TypeSignatureParameterNode
+    (attributes: MultipleAttributeListNode option, identifier: SingleTextNode option, t: Type, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield! noa attributes; yield! noa identifier; yield Type.Node t |]
+
+    member val Attributes = attributes
+    member val Identifier = identifier
+    member val Type = t
+
+/// Example: `A or B` — an F# 9+ type union (disjunction) used in type constraints and signatures.
+type TypeOrNode(lhs: Type, orNode: SingleTextNode, rhs: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Type.Node lhs; yield orNode; yield Type.Node rhs |]
+    member val LeftHandSide = lhs
+    member val Or = orNode
+    member val RightHandSide = rhs
+
+/// Example: `Map<int, string> SomeAlias` — a long identifier applied to a (possibly generic) type expression, used for type aliases or module-qualified types.
+type TypeLongIdentAppNode(appType: Type, longIdent: IdentListNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Type.Node appType; yield longIdent |]
+    member val AppType = appType
+    member val LongIdent = longIdent
+
+/// Example: `IFoo & IBar` — an intersection type (F# 9+), combining multiple types with `&` separators.
+type TypeIntersectionNode(typesAndSeparators: Choice<Type, SingleTextNode> list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            for t in typesAndSeparators do
+                match t with
+                | Choice1Of2 t -> Type.Node t
+                | Choice2Of2 amp -> amp
+        |]
+
+    member val TypesAndSeparators = typesAndSeparators
+
+/// Discriminated union of all F# type expressions in the Oak intermediate representation.
+/// Each case wraps a strongly-typed node that carries the substructure of that type form.
+/// Use <c>Type.Node</c> to obtain the underlying <see cref="Node"/> for printer dispatch.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type Type =
+    | Funs of TypeFunsNode
+    | Tuple of TypeTupleNode
+    | HashConstraint of TypeHashConstraintNode
+    | MeasurePower of TypeMeasurePowerNode
+    | StaticConstant of Constant
+    | StaticConstantExpr of TypeStaticConstantExprNode
+    | StaticConstantNamed of TypeStaticConstantNamedNode
+    | Array of TypeArrayNode
+    | Anon of SingleTextNode
+    | Var of SingleTextNode
+    | AppPostfix of TypeAppPostFixNode
+    | AppPrefix of TypeAppPrefixNode
+    | StructTuple of TypeStructTupleNode
+    | WithSubTypeConstraint of TypeConstraint
+    | WithGlobalConstraints of TypeWithGlobalConstraintsNode
+    | LongIdent of IdentListNode
+    | AnonRecord of TypeAnonRecordNode
+    | Paren of TypeParenNode
+    | SignatureParameter of TypeSignatureParameterNode
+    | Or of TypeOrNode
+    | LongIdentApp of TypeLongIdentAppNode
+    | Intersection of TypeIntersectionNode
+
+    static member Node(x: Type) : Node =
+        match x with
+        | Funs n -> n
+        | Tuple n -> n
+        | HashConstraint n -> n
+        | MeasurePower n -> n
+        | StaticConstant c -> Constant.Node c
+        | StaticConstantExpr n -> n
+        | StaticConstantNamed n -> n
+        | Array n -> n
+        | Anon n -> n
+        | Var n -> n
+        | AppPostfix n -> n
+        | AppPrefix n -> n
+        | StructTuple n -> n
+        | WithSubTypeConstraint tc -> TypeConstraint.Node tc
+        | WithGlobalConstraints n -> n
+        | LongIdent n -> n
+        | AnonRecord n -> n
+        | Paren n -> n
+        | SignatureParameter n -> n
+        | Or n -> n
+        | LongIdentApp n -> n
+        | Intersection n -> n
+
+/// A pattern composed from a left hand-side pattern, a single text token/operator and a right hand-side pattern.
+/// Example (Or): `A | B`
+/// Example (As): `x as y`
+/// Example (ListCons): `head :: tail`
+type PatLeftMiddleRight(lhs: Pattern, middle: Choice<SingleTextNode, string>, rhs: Pattern, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Pattern.Node lhs
+            match middle with
+            | Choice1Of2 n -> yield n
+            | _ -> ()
+            yield Pattern.Node rhs
+        |]
+
+    member val LeftHandSide = lhs
+    member val Middle = middle
+    member val RightHandSide = rhs
+
+/// Example: `pat1 & pat2 & pat3`
+type PatAndsNode(pats: Pattern list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield! List.map Pattern.Node pats |]
+    member val Patterns = pats
+
+/// Example: `[<Attr>] pat: Type` (attributed/typed parameter pattern)
+type PatParameterNode(attributes: MultipleAttributeListNode option, pat: Pattern, t: Type option, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa attributes
+            yield Pattern.Node pat
+            yield! noa (Option.map Type.Node t)
+        |]
+
+    member val Attributes = attributes
+    member val Pattern = pat
+    member val Type = t
+
+/// Example: `( * )` (operator name used as a pattern in member definitions)
+type PatNamedParenStarIdentNode
+    (
+        accessibility: SingleTextNode option,
+        openingParen: SingleTextNode,
+        name: SingleTextNode,
+        closingParen: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa accessibility
+            yield openingParen
+            yield name
+            yield closingParen
+        |]
+
+    member val Accessibility = accessibility
+    member val OpeningParen = openingParen
+    member val Name = name
+    member val ClosingParen = closingParen
+
+/// Example: `x` or `private x` (a simple named binding pattern)
+type PatNamedNode(accessibility: SingleTextNode option, name: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield name |]
+    member val Name = name
+    member val Accessibility = accessibility
+
+/// Example: `field1 = x` — a named field–pattern pair used in union-case destructuring (e.g. `Point(x = px; y = py)`).
+type NamePatPairNode(fieldName: IdentListNode, equals: SingleTextNode, pat: Pattern, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield fieldName; yield equals; yield Pattern.Node pat |]
+    member val FieldName = fieldName
+    member val Equals = equals
+    member val Pattern = pat
+
+/// Example: `MyUnion(field1 = x; field2 = y)` (named field patterns on a union case)
+type PatNamePatPairsNode
+    (
+        identifier: IdentListNode,
+        typarDecls: TyparDecls option,
+        openingParen: SingleTextNode,
+        pairs: NamePatPairNode list,
+        closingParen: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield identifier
+            yield! noa (Option.map TyparDecls.Node typarDecls)
+            yield openingParen
+            yield! nodes pairs
+            yield closingParen
+        |]
+
+    member val Identifier = identifier
+    member val TyparDecls = typarDecls
+    member val OpeningParen = openingParen
+    member val Pairs = pairs
+    member val ClosingParen = closingParen
+
+/// Example: `Some x` or `MyModule.MyDU value` (a union case or long-ident pattern with optional sub-patterns)
+type PatLongIdentNode
+    (
+        accessibility: SingleTextNode option,
+        identifier: IdentListNode,
+        typarDecls: TyparDecls option,
+        parameters: Pattern list,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa accessibility
+            yield identifier
+            yield! noa (Option.map TyparDecls.Node typarDecls)
+            yield! List.map Pattern.Node parameters
+        |]
+
+    member val Accessibility = accessibility
+    member val Identifier = identifier
+    member val TyparDecls = typarDecls
+    member val Parameters = parameters
+
+/// Example: `(pat)` (a parenthesised pattern)
+type PatParenNode(openingParen: SingleTextNode, pat: Pattern, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingParen; yield Pattern.Node pat; yield closingParen |]
+
+    member val OpeningParen = openingParen
+    member val Pattern = pat
+    member val ClosingParen = closingParen
+
+/// Example: `a, b, c` (a tuple pattern)
+type PatTupleNode(items: Choice<Pattern, SingleTextNode> list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            for item in items do
+                match item with
+                | Choice1Of2 p -> Pattern.Node p
+                | Choice2Of2 comma -> comma
+        |]
+
+    member val Items = items
+
+/// Example: `struct (a, b)` (a struct tuple pattern)
+type PatStructTupleNode(pats: Pattern list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield! (List.map Pattern.Node pats) |]
+    member val Patterns = pats
+
+/// Example: `[a; b; c]` (list pattern) or `[| a; b; c |]` (array pattern)
+type PatArrayOrListNode(openToken: SingleTextNode, pats: Pattern list, closeToken: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openToken; yield! List.map Pattern.Node pats; yield closeToken |]
+
+    member val OpenToken = openToken
+    member val Patterns = pats
+    member val CloseToken = closeToken
+
+/// Example: `{ Field1 = x; Field2 = y }` (a record pattern)
+type PatRecordNode(openingNode: SingleTextNode, fields: NamePatPairNode list, closingNode: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingNode; yield! nodes fields; yield closingNode |]
+    member val OpeningNode = openingNode
+    member val Fields = fields
+    member val ClosingNode = closingNode
+
+/// Example: `:? SomeType` (a type-test pattern)
+type PatIsInstNode(token: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield token; yield Type.Node t |]
+    member val Token = token
+    member val Type = t
+
+/// Discriminated union of all F# patterns in the Oak intermediate representation.
+/// Each case wraps a strongly-typed node. Use <c>Pattern.Node</c> for printer dispatch.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type Pattern =
+    | OptionalVal of SingleTextNode
+    | Or of PatLeftMiddleRight
+    | Ands of PatAndsNode
+    | Null of SingleTextNode
+    | Wild of SingleTextNode
+    | Parameter of PatParameterNode
+    | NamedParenStarIdent of PatNamedParenStarIdentNode
+    | Named of PatNamedNode
+    | As of PatLeftMiddleRight
+    | ListCons of PatLeftMiddleRight
+    | NamePatPairs of PatNamePatPairsNode
+    | LongIdent of PatLongIdentNode
+    | Unit of UnitNode
+    | Paren of PatParenNode
+    | Tuple of PatTupleNode
+    | StructTuple of PatStructTupleNode
+    | ArrayOrList of PatArrayOrListNode
+    | Record of PatRecordNode
+    | Const of Constant
+    | IsInst of PatIsInstNode
+    | QuoteExpr of ExprQuoteNode
+
+    static member Node(x: Pattern) : Node =
+        match x with
+        | OptionalVal n -> n
+        | Parameter n -> n
+        | Or n -> n
+        | Ands n -> n
+        | Null n -> n
+        | Wild n -> n
+        | NamedParenStarIdent n -> n
+        | Named n -> n
+        | As n -> n
+        | ListCons n -> n
+        | NamePatPairs n -> n
+        | LongIdent n -> n
+        | Unit n -> n
+        | Paren n -> n
+        | Tuple n -> n
+        | StructTuple n -> n
+        | ArrayOrList n -> n
+        | Record n -> n
+        | Const c -> Constant.Node c
+        | IsInst n -> n
+        | QuoteExpr n -> n
+
+/// Example: `lazy computeExpensiveValue`
+type ExprLazyNode(lazyWord: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield lazyWord; yield Expr.Node expr |]
+
+    member val LazyWord = lazyWord
+    member val Expr = expr
+
+    member val ExprIsInfix =
+        match Expr.Node expr with
+        | :? InfixApp -> true
+        | _ -> false
+
+/// A single expression prefixed by a keyword, e.g. `assert condition`, `yield value`, `return result`,
+/// `upcast expr`, `downcast expr`, `do expr`, `do! asyncExpr`, `return! asyncExpr`.
+/// `AddSpace` controls whether a space is emitted between the keyword and the expression.
+type ExprSingleNode(leading: SingleTextNode, addSpace: bool, supportsStroustrup: bool, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield leading; yield Expr.Node expr |]
+
+    member val Leading = leading
+    member val AddSpace = addSpace
+    member val SupportsStroustrup = supportsStroustrup
+    member val Expr = expr
+
+/// A constant (literal) expression leaf node such as `42`, `"hello"`, `true`, or `3.14`.
+/// This node has no child nodes; all textual content is carried by the source range.
+type ExprConstantNode(range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [||]
+
+/// Example: `<@ expr @>` — a typed quotation; `<@@ expr @@>` — an untyped quotation.
+/// The opening and closing tokens capture the bracket pair; `Expr` is the quoted expression.
+type ExprQuoteNode(openToken: SingleTextNode, expr, closeToken: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openToken; yield Expr.Node expr; yield closeToken |]
+    member val OpenToken = openToken
+    member val Expr = expr
+    member val CloseToken = closeToken
+
+/// Example: `expr : Type` (type annotation), `expr :? Type` (type test / downcast), `expr :>> Type` (upcast).
+/// `Operator` holds the specific type operator string (`:`, `:?`, `:>`, `:>>`).
+type ExprTypedNode(expr: Expr, operator: string, t: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node expr; yield Type.Node t |]
+    member val Expr = expr
+    member val Operator = operator
+    member val Type = t
+
+/// Example: `new StringBuilder(capacity)`
+type ExprNewNode(newKeyword: SingleTextNode, t: Type, arguments: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield newKeyword; yield Type.Node t; yield Expr.Node arguments |]
+
+    member val NewKeyword = newKeyword
+    member val Type = t
+    member val Arguments = arguments
+
+/// Example: `(a, b, c)` — items are interleaved with comma `SingleTextNode` separators
+type ExprTupleNode(items: Choice<Expr, SingleTextNode> list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        items
+        |> Seq.map (
+            function
+            | Choice1Of2 e -> Expr.Node e
+            | Choice2Of2 comma -> comma :> Node
+        )
+        |> Seq.toArray
+
+    member val Items = items
+
+/// Example: `struct (a, b, c)` — a struct tuple expression.
+/// Wraps an `ExprTupleNode` and adds the `struct` keyword and a closing parenthesis.
+type ExprStructTupleNode(structNode: SingleTextNode, tuple: ExprTupleNode, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield structNode; yield tuple; yield closingParen |]
+    member val Struct = structNode
+    member val Tuple = tuple
+    member val ClosingParen = closingParen
+
+/// Example: `[a; b; c]` for a list, `[|a; b; c|]` for an array — determined by the opening/closing tokens
+type ExprArrayOrListNode(openingToken: SingleTextNode, elements: Expr list, closingToken: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingToken; yield! List.map Expr.Node elements; yield closingToken |]
+
+    member val Opening = openingToken
+    member val Elements = elements
+    member val Closing = closingToken
+
+/// Example: `inherit Base` — inherits from a type with no constructor arguments.
+type InheritConstructorTypeOnlyNode(inheritKeyword: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield inheritKeyword; yield Type.Node t |]
+    member val InheritKeyword = inheritKeyword
+    member val Type = t
+
+/// Example: `inherit Base()` — inherits from a type with an explicit unit constructor.
+type InheritConstructorUnitNode
+    (inheritKeyword: SingleTextNode, t: Type, openingParen: SingleTextNode, closingParen: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield inheritKeyword
+            yield Type.Node t
+            yield openingParen
+            yield closingParen
+        |]
+
+    member val InheritKeyword = inheritKeyword
+    member val Type = t
+    member val OpeningParen = openingParen
+    member val ClosingParen = closingParen
+
+/// Example: `inherit Base(arg)` — inherits from a type with a single parenthesised constructor argument.
+type InheritConstructorParenNode(inheritKeyword: SingleTextNode, t: Type, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield inheritKeyword; yield Type.Node t; yield Expr.Node expr |]
+
+    member val InheritKeyword = inheritKeyword
+    member val Type = t
+    member val Expr = expr
+
+/// Example: `inherit Base arg1 arg2` — inherits from a type with non-parenthesised constructor arguments.
+type InheritConstructorOtherNode(inheritKeyword: SingleTextNode, t: Type, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield inheritKeyword; yield Type.Node t; yield Expr.Node expr |]
+
+    member val InheritKeyword = inheritKeyword
+    member val Type = t
+    member val Expr = expr
+
+/// Discriminated union for the argument form following an <c>inherit</c> declaration.
+/// Covers the four constructor syntax variants: bare type, unit <c>()</c>, parenthesised
+/// argument list, and any other expression argument form.
+[<RequireQualifiedAccess; NoComparison>]
+type InheritConstructor =
+    | TypeOnly of InheritConstructorTypeOnlyNode
+    | Unit of InheritConstructorUnitNode
+    | Paren of InheritConstructorParenNode
+    | Other of InheritConstructorOtherNode
+
+    static member Node(ic: InheritConstructor) : Node =
+        match ic with
+        | TypeOnly n -> n
+        | Unit n -> n
+        | Paren n -> n
+        | Other n -> n
+
+    member x.InheritKeyword =
+        match x with
+        | TypeOnly n -> n.InheritKeyword
+        | Unit n -> n.InheritKeyword
+        | Paren n -> n.InheritKeyword
+        | Other n -> n.InheritKeyword
+
+/// Example: `Name = expr` — a single record field assignment inside a record expression or update.
+type RecordFieldNode(fieldName: IdentListNode, equals: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield fieldName; yield equals; yield Expr.Node expr |]
+    member val FieldName = fieldName
+    member val Equals = equals
+    member val Expr = expr
+
+/// Example: `...source` — a spread of an existing value into a record or anonymous record expression.
+/// The source is an arbitrary expression, the same grammar as the right-hand side of a field.
+type ExprSpreadNode(dots: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield dots; yield Expr.Node expr |]
+    member val Dots = dots
+    member val Expr = expr
+
+/// A single item inside a record or anonymous record expression, in source order.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type ExprRecordFieldOrSpread =
+    | Field of RecordFieldNode
+    | Spread of ExprSpreadNode
+
+    static member Node(item: ExprRecordFieldOrSpread) : Node =
+        match item with
+        | Field n -> n
+        | Spread n -> n
+
+/// Abstract base for all record expression nodes, providing shared access to the braces and content.
+[<AbstractClass>]
+type ExprRecordBaseNode
+    (openingBrace: SingleTextNode, fields: ExprRecordFieldOrSpread list, closingBrace: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    member val OpeningBrace = openingBrace
+    member val Fields = fields
+    member val ClosingBrace = closingBrace
+    /// True when the braces hold anything at all, a field assignment or a spread.
+    member x.HasItems = List.isNotEmpty x.Fields
+
+/// <summary>
+/// Represents a record instance, parsed from both `SynExpr.Record` and `SynExpr.AnonRecd`.
+/// </summary>
+/// Example: `{ Field1 = value1; Field2 = value2 }` or with copy-and-update syntax `{ existing with Field1 = newValue }`
+type ExprRecordNode
+    (
+        openingBrace: SingleTextNode,
+        copyInfo: Expr option,
+        fields: ExprRecordFieldOrSpread list,
+        closingBrace: SingleTextNode,
+        range
+    )
+    =
+    inherit ExprRecordBaseNode(openingBrace, fields, closingBrace, range)
+
+    member val CopyInfo = copyInfo
+
+    override val Children: Node array =
+        [|
+            yield openingBrace
+            yield! copyInfo |> Option.map Expr.Node |> noa
+            yield! List.map ExprRecordFieldOrSpread.Node fields
+            yield closingBrace
+        |]
+
+/// Example: `struct {| Name = "Alice"; Age = 30 |}` — an anonymous struct record expression.
+/// Extends `ExprRecordNode` by prepending the `struct` keyword.
+type ExprAnonStructRecordNode
+    (
+        structNode: SingleTextNode,
+        openingBrace: SingleTextNode,
+        copyInfo: Expr option,
+        fields: ExprRecordFieldOrSpread list,
+        closingBrace: SingleTextNode,
+        range
+    )
+    =
+    inherit ExprRecordNode(openingBrace, copyInfo, fields, closingBrace, range)
+    member val Struct = structNode
+
+    override val Children: Node array =
+        [|
+            yield structNode
+            yield openingBrace
+            yield! copyInfo |> Option.map Expr.Node |> noa
+            yield! List.map ExprRecordFieldOrSpread.Node fields
+            yield closingBrace
+        |]
+
+/// Example: `{ inherit Base(args); Field = value }` — a record with an `inherit` constructor call.
+type ExprInheritRecordNode
+    (
+        openingBrace: SingleTextNode,
+        inheritConstructor: InheritConstructor,
+        fields: ExprRecordFieldOrSpread list,
+        closingBrace: SingleTextNode,
+        range
+    )
+    =
+    inherit ExprRecordBaseNode(openingBrace, fields, closingBrace, range)
+
+    member val InheritConstructor = inheritConstructor
+
+    override val Children: Node array =
+        [|
+            yield openingBrace
+            yield InheritConstructor.Node inheritConstructor
+            yield! List.map ExprRecordFieldOrSpread.Node fields
+            yield closingBrace
+        |]
+
+/// Example: `interface IDisposable with member _.Dispose() = ()` — an interface implementation clause inside an object expression or type definition.
+type InterfaceImplNode
+    (
+        interfaceNode: SingleTextNode,
+        t: Type,
+        withNode: SingleTextNode option,
+        bindings: BindingNode list,
+        members: MemberDefn list,
+        range
+    )
+    =
+
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield interfaceNode
+            yield Type.Node t
+            yield! noa withNode
+            yield! nodes bindings
+            yield! List.map MemberDefn.Node members
+        |]
+
+    member val Interface = interfaceNode
+    member val Type = t
+    member val With = withNode
+    member val Bindings = bindings
+    member val Members = members
+
+/// Example: `{ new IDisposable with member _.Dispose() = () }` — an object expression that implements an interface or inherits a base class inline.
+type ExprObjExprNode
+    (
+        openingBrace: SingleTextNode,
+        newNode: SingleTextNode,
+        t: Type,
+        e: Expr option,
+        withNode: SingleTextNode option,
+        bindings: BindingNode list,
+        members: MemberDefn list,
+        interfaces: InterfaceImplNode list,
+        closingBrace: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield openingBrace
+            yield newNode
+            yield Type.Node t
+            yield! noa (Option.map Expr.Node e)
+            yield! noa withNode
+            yield! nodes bindings
+            yield! List.map MemberDefn.Node members
+            yield! nodes interfaces
+            yield closingBrace
+        |]
+
+    member val OpeningBrace = openingBrace
+    member val New = newNode
+    member val Type = t
+    member val Expr = e
+    member val With = withNode
+    member val Bindings = bindings
+    member val Members = members
+    member val Interfaces = interfaces
+    member val ClosingBrace = closingBrace
+
+/// Example: `while i < 10 do printfn "%d" i; i <- i + 1` — a while loop.
+type ExprWhileNode(whileNode: SingleTextNode, whileExpr: Expr, doExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield whileNode; yield Expr.Node whileExpr; yield Expr.Node doExpr |]
+
+    member val While = whileNode
+    member val WhileExpr = whileExpr
+    member val DoExpr = doExpr
+
+/// Example: `for i = 1 to 10 do printfn "%d" i` or `for i = 10 downto 1 do …`.
+/// `Direction` is `true` for ascending (`to`) and `false` for descending (`downto`).
+type ExprForNode
+    (
+        forNode: SingleTextNode,
+        ident: SingleTextNode,
+        equals: SingleTextNode,
+        identBody: Expr,
+        direction: bool,
+        toBody: Expr,
+        doBody: Expr,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield forNode
+            yield ident
+            yield equals
+            yield Expr.Node identBody
+            yield Expr.Node toBody
+            yield Expr.Node doBody
+        |]
+
+    member val For = forNode
+    member val Ident = ident
+    member val Equals = equals
+    member val IdentBody = identBody
+    member val Direction = direction
+    member val ToBody = toBody
+    member val DoBody = doBody
+
+/// Example: `for x in xs do printfn "%A" x` — a `for … in` loop over a sequence.
+/// `IsArrow` is `true` when using arrow syntax (`for x in xs -> expr`) instead of `do`.
+type ExprForEachNode(forNode: SingleTextNode, pat: Pattern, enumExpr: Expr, isArrow: bool, bodyExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield forNode
+            yield Pattern.Node pat
+            yield Expr.Node enumExpr
+            yield Expr.Node bodyExpr
+        |]
+
+    member val For = forNode
+    member val Pattern = pat
+    member val EnumExpr = enumExpr
+    member val IsArrow = isArrow
+    member val BodyExpr = bodyExpr
+
+/// Example: `task { … }` or `async { … }` — a named computation expression with an explicit builder.
+/// The builder expression (`Name`) precedes the braces of the computation body.
+type ExprNamedComputationNode
+    (nameExpr: Expr, openingBrace: SingleTextNode, bodyExpr: Expr, closingBrace: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Expr.Node nameExpr
+            yield openingBrace
+            yield Expr.Node bodyExpr
+            yield closingBrace
+        |]
+
+    member val Name = nameExpr
+    member val OpeningBrace = openingBrace
+    member val Body = bodyExpr
+    member val ClosingBrace = closingBrace
+
+/// Example: `{ let x = 1; yield x }` — an anonymous computation expression (no explicit builder name).
+type ExprComputationNode(openingBrace: SingleTextNode, bodyExpr: Expr, closingBrace: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingBrace; yield Expr.Node bodyExpr; yield closingBrace |]
+
+    member val OpeningBrace = openingBrace
+    member val Body = bodyExpr
+    member val ClosingBrace = closingBrace
+
+/// A single statement inside a computation-expression body.
+/// <c>BindingStatement</c> covers <c>let!</c>, <c>let</c>, <c>use!</c> etc. bindings;
+/// <c>OtherStatement</c> covers any other expression (e.g. <c>return</c>, <c>do!</c>, <c>yield</c>).
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type ComputationExpressionStatement =
+    | BindingStatement of BindingNode
+    | OtherStatement of Expr
+
+    static member Node(ces: ComputationExpressionStatement) : Node =
+        match ces with
+        | BindingStatement n -> n
+        | OtherStatement o -> Expr.Node o
+
+/// The body of a computation expression, consisting of an ordered list of binding statements
+/// (e.g. `let! x = …`) and other expressions (e.g. `return x`, `do! f()`).
+type ExprCompExprBodyNode(statements: ComputationExpressionStatement list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield! List.map ComputationExpressionStatement.Node statements |]
+
+    member val Statements = statements
+
+/// Example: `e1 in e2` — used in query-expression `join … in …` clauses; represents the `in` operator.
+type ExprJoinInNode(lhs: Expr, inNode: SingleTextNode, rhs: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node lhs; yield inNode; yield Expr.Node rhs |]
+    member val LeftHandSide = lhs
+    member val In = inNode
+    member val RightHandSide = rhs
+
+/// Example: `(fun x -> x + 1)` — a lambda expression wrapped in parentheses.
+/// Distinct from `ExprLambdaNode` in that the parens are explicit and tracked as nodes.
+type ExprParenLambdaNode(openingParen: SingleTextNode, lambda: ExprLambdaNode, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield openingParen; yield lambda; yield closingParen |]
+    member val OpeningParen = openingParen
+    member val Lambda = lambda
+    member val ClosingParen = closingParen
+
+/// Example: `fun x y -> x + y`
+type ExprLambdaNode(funNode: SingleTextNode, parameters: Pattern list, arrow: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield funNode
+            yield! List.map Pattern.Node parameters
+            yield arrow
+            yield Expr.Node expr
+        |]
+
+    member val Fun = funNode
+    member val Parameters = parameters
+    member val Arrow = arrow
+    member val Expr = expr
+
+/// Example: `| pat when guard -> body` — a single arm of a `match` or `try…with` expression.
+/// The leading bar, guard (`when` clause), and arrow are all optional depending on context.
+type MatchClauseNode
+    (bar: SingleTextNode option, pattern: Pattern, whenExpr: Expr option, arrow: SingleTextNode, bodyExpr: Expr, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa bar
+            yield Pattern.Node pattern
+            yield! noa (Option.map Expr.Node whenExpr)
+            yield arrow
+            yield Expr.Node bodyExpr
+        |]
+
+    member val Bar = bar
+    member val Pattern = pattern
+    member val WhenExpr = whenExpr
+    member val Arrow = arrow
+    member val BodyExpr = bodyExpr
+
+/// Example: `function | Some x -> x | None -> defaultValue`
+type ExprMatchLambdaNode(functionNode: SingleTextNode, clauses: MatchClauseNode list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield functionNode; yield! nodes clauses |]
+    member val Function = functionNode
+    member val Clauses = clauses
+
+/// Example: `match x with | Some v -> v | None -> 0`
+type ExprMatchNode
+    (matchNode: SingleTextNode, matchExpr: Expr, withNode: SingleTextNode, clauses: MatchClauseNode list, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield matchNode
+            yield Expr.Node matchExpr
+            yield withNode
+            yield! nodes clauses
+        |]
+
+    member val Match = matchNode
+    member val MatchExpr = matchExpr
+    member val With = withNode
+    member val Clauses = clauses
+
+/// Example: `(^T : (member Get : unit -> int) t)` — a statically-resolved type parameter (SRTP) trait call.
+/// Invokes `MemberDefn` on value `Expr` constrained to type `Type` at compile time.
+type ExprTraitCallNode(t: Type, md: MemberDefn, expr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Type.Node t; yield MemberDefn.Node md; yield Expr.Node expr |]
+
+    member val Type = t
+    member val MemberDefn = md
+    member val Expr = expr
+
+/// Example: `( * )` or `( + )` — an operator name wrapped in parentheses, used as a first-class function value.
+type ExprParenFunctionNameWithStarNode
+    (openingParen: SingleTextNode, functionName: SingleTextNode, closingParen: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingParen; yield functionName; yield closingParen |]
+    member val OpeningParen = openingParen
+    member val FunctionName = functionName
+    member val ClosingParen = closingParen
+
+/// Example: `(expr)` — an expression explicitly wrapped in parentheses for grouping or disambiguation.
+type ExprParenNode(openingParen: SingleTextNode, expr: Expr, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingParen; yield Expr.Node expr; yield closingParen |]
+
+    member val OpeningParen = openingParen
+    member val Expr = expr
+    member val ClosingParen = closingParen
+
+/// Example: `obj?Property` — dynamic member access using the `?` operator.
+/// `FuncExpr` is the object; `ArgExpr` is the property name (often a string constant).
+type ExprDynamicNode(funcExpr: Expr, argExpr: Expr, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Expr.Node funcExpr; yield Expr.Node argExpr |]
+    member val FuncExpr = funcExpr
+    member val ArgExpr = argExpr
+
+/// A single `?member` (with optional paren or unit argument) inside a <see cref="ExprDynamicChainNode"/>.
+type ExprDynamicChainItemNode(memberExpr: Expr, parenArg: Expr option, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node memberExpr; yield! noa (Option.map Expr.Node parenArg) |]
+
+    member val MemberExpr = memberExpr
+    member val ParenArg = parenArg
+
+/// Example: `x?a("")?b(t)` — a chain of two or more `?` operator accesses.
+/// Captured as a dedicated node so the printer can keep `?member(arg)` tight,
+/// because adding a space before the paren argument changes parsing of the
+/// following `?member`. See #3159.
+type ExprDynamicChainNode(leadingExpr: Expr, items: ExprDynamicChainItemNode list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node leadingExpr; yield! nodes items |]
+
+    member val LeadingExpr = leadingExpr
+    member val Items = items
+
+/// Example: `!x`, `-x`, `~~~x` — a prefix (unary) operator applied to an expression.
+type ExprPrefixAppNode(operator: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield operator; yield Expr.Node expr |]
+    member val Operator = operator
+    member val Expr = expr
+
+/// Marker interface implemented by <see cref="ExprSameInfixAppsNode"/> and
+/// <see cref="ExprInfixAppNode"/> to allow the printer to treat both infix-application
+/// forms uniformly when deciding layout (e.g. newline-infix formatting).
+type InfixApp = interface end
+
+/// Example: `a + b + c` — a sequence of the *same* operator applied repeatedly (avoids redundant nesting)
+type ExprSameInfixAppsNode(leadingExpr: Expr, subsequentExpressions: (SingleTextNode * Expr) list, range) =
+    inherit NodeBase(range)
+    interface InfixApp
+
+    override val Children: Node array =
+        let xs =
+            List.collect (fun (operator, expr) -> [ (operator :> Node); Expr.Node expr ]) subsequentExpressions
+
+        [| yield Expr.Node leadingExpr; yield! xs |]
+
+    member val LeadingExpr = leadingExpr
+    member val SubsequentExpressions = subsequentExpressions
+
+/// Example: `a + b` — a single binary infix application with two different operands or operators
+type ExprInfixAppNode(lhs: Expr, operator: SingleTextNode, rhs: Expr, range) =
+    inherit NodeBase(range)
+    interface InfixApp
+
+    override val Children: Node array = [| yield Expr.Node lhs; yield operator; yield Expr.Node rhs |]
+    member val LeftHandSide = lhs
+    member val RightHandSide: Expr = rhs
+    member val Operator = operator
+
+/// Example: `xs[i]` — index access using the new F# 6+ dot-free bracket syntax.
+/// `Identifier` is the collection; `Index` is the index expression inside `[…]`.
+type ExprIndexWithoutDotNode(identifierExpr: Expr, indexExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node identifierExpr; yield Expr.Node indexExpr |]
+    member val Identifier = identifierExpr
+    member val Index = indexExpr
+
+/// The argument of a call within a chain — either a parenthesised expression or unit.
+[<RequireQualifiedAccess; NoComparison; NoEquality>]
+type ChainCall =
+    | Paren of ExprParenNode
+    | Unit of UnitNode
+
+/// A single dot-prefixed step in a member-access or call chain.
+/// Every step is reached through a <c>.</c>; the dot is an explicit <see cref="SingleTextNode"/>
+/// so that trivia (comments, blank lines) attached to it are preserved during formatting.
+///
+/// A segment is always <em>intermediate</em>: the final call of a chain is the
+/// <c>ExprChain.Terminal</c>, never a segment here.  That is why <c>DotApplication</c> (an
+/// intermediate call) is distinct from <c>DotMember</c> (plain access) — the distinction the
+/// layout cares about (navigation vs. action) is then visible in the shape of the data itself.
+[<RequireQualifiedAccess; NoComparison; NoEquality>]
+type ChainSegment =
+    ///   .Foo        — plain property access (navigation)
+    ///   .Items[0]   — expr = IndexWithoutDot(Items, [0]), no dedicated case needed
+    | DotMember of dot: SingleTextNode * expr: Expr
+    ///   .Foo(x)     — intermediate call — always tight, never a space before (
+    ///   .Foo()      — intermediate unit call — always tight
+    /// e.g. the `.Foo(x)` in `a.Foo(x).Bar`.  The terminal call of a chain is not a segment.
+    | DotApplication of dot: SingleTextNode * expr: Expr * call: ChainCall
+    /// Old dot-bracket index syntax: <c>arr.[i]</c>.
+    /// <c>DotIndex</c> is a separate case rather than <c>DotMember</c> because the <c>[</c> and
+    /// <c>]</c> brackets are <em>not</em> part of <c>indexExpr</c> in the AST — <c>genExpr
+    /// indexExpr</c> produces only the content (e.g. <c>0</c>), not <c>[0]</c>.  No existing
+    /// <c>Expr</c> type naturally renders bracketed index content, so the printer must add
+    /// <c>[</c> and <c>]</c> explicitly.  From a layout perspective <c>DotIndex</c> is
+    /// identical to <c>DotMember</c> — both are navigation segments with no call.
+    | DotIndex of dot: SingleTextNode * indexExpr: Expr
+
+/// Controls whether and how a space is emitted before the terminal call's parenthesis.
+/// The terminal call is the only position in a chain where a space is negotiable;
+/// intermediate calls are always tight (adding a space before their parens changes the parse tree).
+[<RequireQualifiedAccess; NoComparison; NoEquality>]
+type ChainTerminal =
+    | SpaceAllowed of ChainCall // regular chain — space governed by SpaceBeforeUppercaseInvocation / SpaceBeforeLowercaseInvocation, depending on the casing of the called identifier
+    | NoSpaceAllowed of ChainCall // space never permitted: a DotLambda body (compiler constraint), a call used as a chain receiver, or any atomic position (see mkAtomicExpr)
+    | NoTerminal // chain ends with a property access or index, no invocation
+
+/// Example: `person.Address.City.ToUpper()` — a chain of dot-separated member accesses and calls.
+/// <c>Head</c> is the leading receiver expression (fully decomposed; no dotted content remains in it).
+/// <c>Segments</c> are the dot-paired steps. <c>Terminal</c> is the optional outermost call.
+type ExprChain(head: Expr, segments: ChainSegment list, terminal: ChainTerminal, range) =
+    inherit NodeBase(range)
+    member val Head = head
+    member val Segments = segments
+    member val Terminal = terminal
+
+    override val Children: Node array =
+        [|
+            yield Expr.Node head
+
+            for segment in segments do
+                match segment with
+                | ChainSegment.DotMember(dot, expr) ->
+                    yield dot
+                    yield Expr.Node expr
+                | ChainSegment.DotApplication(dot, expr, call) ->
+                    yield dot
+                    yield Expr.Node expr
+
+                    match call with
+                    | ChainCall.Paren p -> yield p
+                    | ChainCall.Unit u -> yield u
+                | ChainSegment.DotIndex(dot, idx) ->
+                    yield dot
+                    yield Expr.Node idx
+
+            match terminal with
+            | ChainTerminal.SpaceAllowed(ChainCall.Paren p)
+            | ChainTerminal.NoSpaceAllowed(ChainCall.Paren p) -> yield p
+            | ChainTerminal.SpaceAllowed(ChainCall.Unit u)
+            | ChainTerminal.NoSpaceAllowed(ChainCall.Unit u) -> yield u
+            | ChainTerminal.NoTerminal -> ()
+        |]
+
+/// Example: `f(a)` — a general expression (not a simple dotted name) applied to a single parenthesised argument
+type ExprAppSingleParenArgNode(functionExpr: Expr, argExpr: Expr, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Expr.Node functionExpr; yield Expr.Node argExpr |]
+    member val FunctionExpr = functionExpr
+    member val ArgExpr = argExpr
+
+/// Example: `f a b (fun y -> y)`, a function applied to zero or more prefix arguments
+/// followed by a parenthesised lambda or `function` expression as the last argument.
+type ExprAppWithLambdaNode
+    (
+        functionName: Expr,
+        arguments: Expr list,
+        openingParen: SingleTextNode,
+        lambda: Choice<ExprLambdaNode, ExprMatchLambdaNode>,
+        closingParen: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        let lambdaNode =
+            match lambda with
+            | Choice1Of2 n -> n :> Node
+            | Choice2Of2 n -> n
+
+        [|
+            yield Expr.Node functionName
+            yield! List.map Expr.Node arguments
+            yield openingParen
+            yield lambdaNode
+            yield closingParen
+        |]
+
+    member val FunctionName = functionName
+    member val Arguments = arguments
+    member val OpeningParen = openingParen
+    member val Lambda = lambda
+    member val ClosingParen = closingParen
+
+/// Example: `List.map f xs` — a function applied to two or more space-separated arguments
+type ExprAppNode(functionExpr: Expr, arguments: Expr list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node functionExpr; yield! List.map Expr.Node arguments |]
+
+    member val FunctionExpr: Expr = functionExpr
+    member val Arguments: Expr list = arguments
+
+/// Example: `id<int>` or `List.empty<string>` — a generic type application using angle-bracket syntax.
+type ExprTypeAppNode
+    (identifierExpr: Expr, lessThan: SingleTextNode, typeParameters: Type list, greaterThan: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Expr.Node identifierExpr
+            yield lessThan
+            yield! List.map Type.Node typeParameters
+            yield greaterThan
+        |]
+
+    member val Identifier = identifierExpr
+    member val LessThan = lessThan
+    member val TypeParameters = typeParameters
+    member val GreaterThan = greaterThan
+
+/// Example: `try riskyOp() with :? IOException -> "IO error"` — a try/with with exactly one match clause.
+/// Used as an optimised form when a single pattern covers all exception cases.
+type ExprTryWithSingleClauseNode
+    (tryNode: SingleTextNode, tryExpr: Expr, withNode: SingleTextNode, clause: MatchClauseNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield tryNode; yield Expr.Node tryExpr; yield withNode; yield clause |]
+
+    member val Try = tryNode
+    member val TryExpr = tryExpr
+    member val With = withNode
+    member val Clause = clause
+
+/// Example: `try riskyOp() with | :? IOException -> "IO" | ex -> sprintf "other: %O" ex` — a try/with with multiple match clauses.
+type ExprTryWithNode
+    (tryNode: SingleTextNode, tryExpr: Expr, withNode: SingleTextNode, clauses: MatchClauseNode list, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield tryNode
+            yield Expr.Node tryExpr
+            yield withNode
+            yield! nodes clauses
+        |]
+
+    member val Try = tryNode
+    member val TryExpr = tryExpr
+    member val With = withNode
+    member val Clauses = clauses
+
+/// Example: `try riskyOp() finally cleanup()` — a try/finally expression that always runs `FinallyExpr`.
+type ExprTryFinallyNode(tryNode: SingleTextNode, tryExpr: Expr, finallyNode: SingleTextNode, finallyExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield tryNode
+            yield Expr.Node tryExpr
+            yield finallyNode
+            yield Expr.Node finallyExpr
+        |]
+
+    member val Try = tryNode
+    member val TryExpr = tryExpr
+    member val Finally = finallyNode
+    member val FinallyExpr = finallyExpr
+
+/// The leading keyword of an `if` expression: a single `if` or `elif` token, or the two tokens of `else if`.
+/// CodePrinter writes `else if` as one piece and moves the trivia that sat between the two keywords.
+[<RequireQualifiedAccess; NoComparison>]
+type IfKeywordNode =
+    | SingleWord of SingleTextNode
+    | ElseIf of elseNode: SingleTextNode * ifNode: SingleTextNode
+
+    member x.Nodes: Node array =
+        match x with
+        | SingleWord n -> [| n |]
+        | ElseIf(elseNode, ifNode) -> [| elseNode; ifNode |]
+
+    member x.Range: range =
+        match x with
+        | SingleWord n -> n.Range
+        | ElseIf(elseNode, ifNode) -> Range.unionRanges elseNode.Range ifNode.Range
+
+/// Example: `if condition then result`
+type ExprIfThenNode(ifNode: IfKeywordNode, ifExpr: Expr, thenNode: SingleTextNode, thenExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! ifNode.Nodes
+            yield Expr.Node ifExpr
+            yield thenNode
+            yield Expr.Node thenExpr
+        |]
+
+    member val If = ifNode
+    member val IfExpr = ifExpr
+    member val Then = thenNode
+    member val ThenExpr = thenExpr
+
+/// Example: `if condition then trueResult else falseResult`
+type ExprIfThenElseNode
+    (
+        ifNode: IfKeywordNode,
+        ifExpr: Expr,
+        thenNode: SingleTextNode,
+        thenExpr: Expr,
+        elseNode: SingleTextNode,
+        elseExpr: Expr,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! ifNode.Nodes
+            yield Expr.Node ifExpr
+            yield thenNode
+            yield Expr.Node thenExpr
+            yield elseNode
+            yield Expr.Node elseExpr
+        |]
+
+    member val If = ifNode
+    member val IfExpr = ifExpr
+    member val Then = thenNode
+    member val ThenExpr = thenExpr
+    member val Else = elseNode
+    member val ElseExpr = elseExpr
+
+/// Example: `if a then x elif b then y else z` — contains one or more `if/elif` branches and an optional `else`
+type ExprIfThenElifNode(branches: ExprIfThenNode list, elseBranch: (SingleTextNode * Expr) option, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        let elseNodes =
+            match elseBranch with
+            | None -> []
+            | Some(elseNode, elseExpr) -> [ yield (elseNode :> Node); yield Expr.Node elseExpr ]
+
+        [| yield! nodes branches; yield! elseNodes |]
+
+    member val Branches = branches
+    member val Else = elseBranch
+
+/// A name used as an expression, the compiler's <c>SynExpr.LongIdent</c>.
+/// Despite the case name, <c>IsOptional</c> is true only for the last shape below.
+///
+/// <code>
+/// value           // a name
+/// Module.value    // two of these inside a chain: `Module`, then `.value`
+/// f (?x = 1)      // the `?x`, the one shape IsOptional is true for
+/// </code>
+type ExprOptVarNode(isOptional: bool, identifier: IdentListNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield identifier |]
+    member val IsOptional = isOptional
+    member val Identifier = identifier
+
+/// Example: `Module.mutableValue <- newValue` — mutation via a long (dotted) identifier.
+type ExprLongIdentSetNode(identifier: IdentListNode, rhs: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield identifier; yield Expr.Node rhs |]
+    member val Identifier = identifier
+    member val Expr = rhs
+
+/// Example: `arr.[i] <- value` — indexed set using the older dot-bracket syntax (deprecated in F# 6).
+type ExprDotIndexedSetNode(objectExpr: Expr, indexExpr: Expr, valueExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Expr.Node objectExpr
+            yield Expr.Node indexExpr
+            yield Expr.Node valueExpr
+        |]
+
+    member val ObjectExpr = objectExpr
+    member val Index = indexExpr
+    member val Value = valueExpr
+
+/// Example: `myProp[key] <- value` — sets a named indexed property on a type.
+type ExprNamedIndexedPropertySetNode(identifier: IdentListNode, indexExpr: Expr, valueExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield identifier; yield Expr.Node indexExpr; yield Expr.Node valueExpr |]
+
+    member val Identifier = identifier
+    member val Index = indexExpr
+    member val Value = valueExpr
+
+/// Example: `obj.Item[key] <- value` — sets a named indexed property accessed through a dotted expression.
+type ExprDotNamedIndexedPropertySetNode
+    (identifierExpr: Expr, name: IdentListNode, propertyExpr: Expr, setExpr: Expr, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Expr.Node identifierExpr
+            yield name
+            yield Expr.Node propertyExpr
+            yield Expr.Node setExpr
+        |]
+
+    member val Identifier = identifierExpr
+    member val Name = name
+    member val Property = propertyExpr
+    member val Set = setExpr
+
+/// Example: `x <- newValue` — an imperative assignment (mutation) expression.
+type ExprSetNode(identifier: Expr, setExpr: Expr, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Expr.Node identifier; yield Expr.Node setExpr |]
+    member val Identifier = identifier
+    member val Set = setExpr
+
+/// Example: `when 'T = int` — a static optimisation constraint that requires a type parameter to equal a specific type constructor.
+type StaticOptimizationConstraintWhenTyparTyconEqualsTyconNode(typar: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield typar; yield Type.Node t |]
+    member val TypeParameter = typar
+    member val Type = t
+
+/// A static optimisation constraint attached to an <c>Expr.LibraryOnlyStaticOptimization</c>
+/// node (internal compiler use, not user-facing F# syntax).
+/// <c>WhenTyparTyconEqualsTycon</c> represents <c>when 'T = SomeType</c>;
+/// <c>WhenTyparIsStruct</c> represents <c>when 'T: struct</c>.
+[<NoComparison>]
+type StaticOptimizationConstraint =
+    | WhenTyparTyconEqualsTycon of StaticOptimizationConstraintWhenTyparTyconEqualsTyconNode
+    | WhenTyparIsStruct of SingleTextNode
+
+    static member Node(c: StaticOptimizationConstraint) : Node =
+        match c with
+        | WhenTyparTyconEqualsTycon n -> n
+        | WhenTyparIsStruct n -> n
+
+/// Internal compiler node for static optimisation hints (library/compiler use only, not user-facing).
+/// Emits an expression with attached `StaticOptimizationConstraint` conditions.
+type ExprLibraryOnlyStaticOptimizationNode
+    (optimizedExpr: Expr, constraints: StaticOptimizationConstraint list, expr: Expr, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Expr.Node optimizedExpr
+            yield! List.map StaticOptimizationConstraint.Node constraints
+            yield Expr.Node expr
+        |]
+
+    member val OptimizedExpr = optimizedExpr
+    member val Constraints = constraints
+    member val Expr = expr
+
+/// An interpolated-string fill hole: an expression together with an optional format identifier (e.g., `{x:N2}`).
+type FillExprNode(expr: Expr, ident: SingleTextNode option, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Expr.Node expr; yield! noa ident |]
+    member val Expr = expr
+    member val Ident = ident
+
+/// Example: `$"hello {name}, you are {age} years old"` — an interpolated string expression.
+/// `Parts` interleaves raw string `SingleTextNode` segments with `FillExprNode` interpolation holes.
+type ExprInterpolatedStringExprNode(parts: Choice<SingleTextNode, FillExprNode> list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield!
+                List.map
+                    (function
+                    | Choice1Of2 n -> (n :> Node)
+                    | Choice2Of2 n -> (n :> Node))
+                    parts
+        |]
+
+    member val Parts = parts
+
+/// Example: `0..2..10` — a three-part numeric range with start, step, and end values (used in slice expressions).
+type ExprTripleNumberIndexRangeNode
+    (
+        startNode: SingleTextNode,
+        startDots: SingleTextNode,
+        centerNode: SingleTextNode,
+        endDots: SingleTextNode,
+        endNode: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield startNode
+            yield startDots
+            yield centerNode
+            yield endDots
+            yield endNode
+        |]
+
+    member val Start = startNode
+    member val StartDots = startDots
+    member val Center = centerNode
+    member val EndDots = endDots
+    member val End = endNode
+
+/// Example: `0..10`, `..10`, `0..`, `..` — a two-part index range (used in slice expressions and list comprehensions).
+/// Either `From` or `To` (or both) may be absent, producing an open-ended range.
+type ExprIndexRangeNode(fromExpr: Expr option, dots: SingleTextNode, toExpr: Expr option, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa (Option.map Expr.Node fromExpr)
+            yield dots
+            yield! noa (Option.map Expr.Node toExpr)
+        |]
+
+    member val From = fromExpr
+    member val Dots = dots
+    member val To = toExpr
+
+/// Example: `^1` or `^0` — an end-relative index expression (from-end indexer, F# 6+).
+type ExprIndexFromEndNode(expr: Expr, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| Expr.Node expr |]
+    member val Expr = expr
+
+/// Example: `begin expr end` — explicit `begin`/`end` block delimiters (equivalent to parentheses).
+type ExprBeginEndNode(beginNode: SingleTextNode, expr: Expr, endNode: SingleTextNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield beginNode; yield Expr.Node expr; yield endNode |]
+
+    member val Begin = beginNode
+    member val Expr = expr
+    member val End = endNode
+
+/// then <expr>
+/// Only valid in secondary constructors, original coming from SynExpr.Sequential(trivia = { SeparatorRange = Some mThen })
+type ExprExplicitConstructorThenExpr(thenNode: SingleTextNode, expr: Expr, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield thenNode; yield Expr.Node expr |]
+    member val Then = thenNode
+    member val Expr = expr
+
+/// Discriminated union of all F# expressions in the Oak intermediate representation.
+/// Each case wraps a strongly-typed node that captures the exact sub-structure needed
+/// for formatting. Use <c>Expr.Node</c> to obtain the underlying <see cref="Node"/>
+/// for printer dispatch, and <c>Expr.NodeRange</c> for range queries.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type Expr =
+    | Lazy of ExprLazyNode
+    | Single of ExprSingleNode
+    | Constant of Constant
+    | Null of SingleTextNode
+    | Quote of ExprQuoteNode
+    | Typed of ExprTypedNode
+    | New of ExprNewNode
+    | Tuple of ExprTupleNode
+    | StructTuple of ExprStructTupleNode
+    | ArrayOrList of ExprArrayOrListNode
+    | Record of ExprRecordNode
+    | InheritRecord of ExprInheritRecordNode
+    | AnonStructRecord of ExprAnonStructRecordNode
+    | ObjExpr of ExprObjExprNode
+    | While of ExprWhileNode
+    | For of ExprForNode
+    | ForEach of ExprForEachNode
+    | NamedComputation of ExprNamedComputationNode
+    | Computation of ExprComputationNode
+    | CompExprBody of ExprCompExprBodyNode
+    | JoinIn of ExprJoinInNode
+    | ParenLambda of ExprParenLambdaNode
+    | Lambda of ExprLambdaNode
+    | MatchLambda of ExprMatchLambdaNode
+    | Match of ExprMatchNode
+    | TraitCall of ExprTraitCallNode
+    | ParenILEmbedded of SingleTextNode
+    | ParenFunctionNameWithStar of ExprParenFunctionNameWithStarNode
+    | Paren of ExprParenNode
+    | Dynamic of ExprDynamicNode
+    | DynamicChain of ExprDynamicChainNode
+    | PrefixApp of ExprPrefixAppNode
+    | SameInfixApps of ExprSameInfixAppsNode
+    | InfixApp of ExprInfixAppNode
+    | IndexWithoutDot of ExprIndexWithoutDotNode
+    | AppSingleParenArg of ExprAppSingleParenArgNode
+    | AppWithLambda of ExprAppWithLambdaNode
+    | App of ExprAppNode
+    | TypeApp of ExprTypeAppNode
+    | TryWithSingleClause of ExprTryWithSingleClauseNode
+    | TryWith of ExprTryWithNode
+    | TryFinally of ExprTryFinallyNode
+    | IfThen of ExprIfThenNode
+    | IfThenElse of ExprIfThenElseNode
+    | IfThenElif of ExprIfThenElifNode
+    | Ident of SingleTextNode
+    /// A name used as an expression: `value`, `Module.value`. See <see cref="ExprOptVarNode"/>.
+    | OptVar of ExprOptVarNode
+    | LongIdentSet of ExprLongIdentSetNode
+    | DotIndexedSet of ExprDotIndexedSetNode
+    | NamedIndexedPropertySet of ExprNamedIndexedPropertySetNode
+    | DotNamedIndexedPropertySet of ExprDotNamedIndexedPropertySetNode
+    | Set of ExprSetNode
+    | LibraryOnlyStaticOptimization of ExprLibraryOnlyStaticOptimizationNode
+    | InterpolatedStringExpr of ExprInterpolatedStringExprNode
+    | IndexRangeWildcard of SingleTextNode
+    | TripleNumberIndexRange of ExprTripleNumberIndexRangeNode
+    | IndexRange of ExprIndexRangeNode
+    | IndexFromEnd of ExprIndexFromEndNode
+    | Typar of SingleTextNode
+    | Chain of ExprChain
+    | BeginEnd of ExprBeginEndNode
+    | ExplicitConstructorThenExpr of ExprExplicitConstructorThenExpr
+
+    static member Node(x: Expr) : Node =
+        match x with
+        | Lazy n -> n
+        | Single n -> n
+        | Constant n -> Constant.Node n
+        | Null n -> n
+        | Quote n -> n
+        | Typed n -> n
+        | New n -> n
+        | Tuple n -> n
+        | StructTuple n -> n
+        | ArrayOrList n -> n
+        | Record n -> n
+        | InheritRecord n -> n
+        | AnonStructRecord n -> n
+        | ObjExpr n -> n
+        | While n -> n
+        | For n -> n
+        | ForEach n -> n
+        | NamedComputation n -> n
+        | Computation n -> n
+        | CompExprBody n -> n
+        | JoinIn n -> n
+        | ParenLambda n -> n
+        | Lambda n -> n
+        | MatchLambda n -> n
+        | Match n -> n
+        | TraitCall n -> n
+        | ParenILEmbedded n -> n
+        | ParenFunctionNameWithStar n -> n
+        | Paren n -> n
+        | Dynamic n -> n
+        | DynamicChain n -> n
+        | PrefixApp n -> n
+        | SameInfixApps n -> n
+        | InfixApp n -> n
+        | IndexWithoutDot n -> n
+        | AppSingleParenArg n -> n
+        | AppWithLambda n -> n
+        | App n -> n
+        | TypeApp n -> n
+        | TryWithSingleClause n -> n
+        | TryWith n -> n
+        | TryFinally n -> n
+        | IfThen n -> n
+        | IfThenElse n -> n
+        | IfThenElif n -> n
+        | Ident n -> n
+        | OptVar n -> n
+        | LongIdentSet n -> n
+        | DotIndexedSet n -> n
+        | NamedIndexedPropertySet n -> n
+        | DotNamedIndexedPropertySet n -> n
+        | Set n -> n
+        | LibraryOnlyStaticOptimization n -> n
+        | InterpolatedStringExpr n -> n
+        | IndexRangeWildcard n -> n
+        | TripleNumberIndexRange n -> n
+        | IndexRange n -> n
+        | IndexFromEnd n -> n
+        | Typar n -> n
+        | Chain n -> n
+        | BeginEnd n -> n
+        | ExplicitConstructorThenExpr n -> n
+
+    member e.HasParentheses: bool =
+        match e with
+        | Expr.Paren _ -> true
+        | _ -> false
+
+/// Example: `open System.IO` — an `open` declaration that brings a module or namespace into scope by qualified name.
+type OpenModuleOrNamespaceNode(identListNode: IdentListNode, range) =
+    inherit NodeBase(range)
+
+    override val Children = Array.empty
+    member val Name = identListNode
+
+/// Example: `open type System.Math` — an `open type` declaration that brings static members and nested types into scope.
+type OpenTargetNode(target: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Type.Node target |]
+    member val Target = target
+
+/// Discriminated union for the two forms of <c>open</c> declaration.
+/// <c>ModuleOrNamespace</c> represents <c>open System.IO</c>;
+/// <c>Target</c> represents <c>open type System.Math</c>.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type Open =
+    | ModuleOrNamespace of OpenModuleOrNamespaceNode
+    | Target of OpenTargetNode
+
+    static member Node(x: Open) : Node =
+        match x with
+        | ModuleOrNamespace n -> n
+        | Target n -> n
+
+/// A group of consecutive `open` statements (module/namespace opens and type-directed opens).
+type OpenListNode(opens: Open list) =
+    inherit NodeBase(List.map (Open.Node >> nodeRange) opens |> combineRanges)
+
+    override val Children: Node array = [| yield! (List.map Open.Node opens) |]
+    member val Opens = opens
+
+/// A group of consecutive hash directives (e.g. `#r "..."` followed by `#load "..."`) treated as a single declaration.
+type HashDirectiveListNode(hashDirectives: ParsedHashDirectiveNode list) =
+    inherit NodeBase(hashDirectives |> List.map (fun n -> n.Range) |> combineRanges)
+
+    override val Children: Node array = [| yield! nodes hashDirectives |]
+    member val HashDirectives = hashDirectives
+
+/// Example: `[<MyAttr(42)>]` — a single attribute inside an attribute list.
+/// <c>Target</c> is the optional `return:`, `assembly:`, etc. prefix.
+type AttributeNode(typeName: IdentListNode, expr: Expr option, target: SingleTextNode option, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield! noa target; yield typeName; yield! noa (Option.map Expr.Node expr) |]
+
+    member val TypeName = typeName
+    member val Expr = expr
+    member val Target = target
+
+/// The content from [< to >]
+type AttributeListNode
+    (openingToken: SingleTextNode, attributesNodes: AttributeNode list, closingToken: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingToken; yield! nodes attributesNodes; yield closingToken |]
+
+    member val Opening = openingToken
+    member val Attributes = attributesNodes
+    member val Closing = closingToken
+
+/// All attribute lists on a declaration: zero or more <c>[&lt; ... &gt;]</c> blocks each containing one or more attributes.
+type MultipleAttributeListNode(attributeLists: AttributeListNode list, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield! nodes attributeLists |]
+    member val AttributeLists = attributeLists
+    member val IsEmpty = attributeLists.IsEmpty
+
+/// Top-level attributes with an optional `do` expression (e.g., `[<assembly: AssemblyVersion("1.0")>]`) — module-level attribute declarations.
+type ModuleDeclAttributesNode(attributes: MultipleAttributeListNode option, doExpr: Expr, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield! noa attributes; yield Expr.Node doExpr |]
+    member val Attributes = attributes
+    member val Expr = doExpr
+
+/// Example: `exception MyError of string` — an exception type definition with an optional member block.
+type ExceptionDefnNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        exceptionKeyword: SingleTextNode,
+        accessibility: SingleTextNode option,
+        unionCase: UnionCaseNode,
+        withKeyword: SingleTextNode option,
+        ms: MemberDefn list,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield exceptionKeyword
+            yield! noa accessibility
+            yield unionCase
+            yield! noa withKeyword
+            yield! nodes (List.map MemberDefn.Node ms)
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val ExceptionKeyword = exceptionKeyword
+    member val Accessibility = accessibility
+    member val UnionCase = unionCase
+    member val WithKeyword = withKeyword
+    member val Members = ms
+
+/// A single parameter in an `extern` binding: optional attributes, an optional type, and an optional pattern name.
+type ExternBindingPatternNode
+    (attributes: MultipleAttributeListNode option, t: Type option, pat: Pattern option, range: range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa attributes
+            yield! noa (Option.map Type.Node t)
+            yield! noa (Option.map Pattern.Node pat)
+        |]
+
+    member val Attributes = attributes
+    member val Type = t
+    member val Pattern = pat
+
+/// Example: `[<DllImport("lib.dll")>] extern int myFunc(int a, string b)` — a P/Invoke extern binding.
+type ExternBindingNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        externNode: SingleTextNode,
+        attributesOfType: MultipleAttributeListNode option,
+        t: Type,
+        accessibility: SingleTextNode option,
+        identifier: IdentListNode,
+        openingParen: SingleTextNode,
+        parameters: ExternBindingPatternNode list,
+        closingParen: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield externNode
+            yield! noa attributesOfType
+            yield Type.Node t
+            yield! noa accessibility
+            yield identifier
+            yield openingParen
+            yield! nodes parameters
+            yield closingParen
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val Extern = externNode
+    member val AttributesOfType = attributesOfType
+    member val Type = t
+    member val Accessibility = accessibility
+    member val Identifier = identifier
+    member val OpeningParen = openingParen
+    member val Parameters = parameters
+    member val ClosingParen = closingParen
+
+/// Example: `module M = Ns.OtherModule` — a module abbreviation that creates a short alias for a qualified module.
+type ModuleAbbrevNode(moduleNode: SingleTextNode, name: SingleTextNode, alias: IdentListNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield moduleNode; yield name; yield alias |]
+    member val Module = moduleNode
+    member val Name = name
+    member val Alias = alias
+
+/// Example: `module rec Utils = …` — a nested module definition (non-top-level) with its declarations.
+type NestedModuleNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        moduleKeyword: SingleTextNode,
+        accessibility: SingleTextNode option,
+        isRecursive: bool,
+        identifier: IdentListNode,
+        equalsNode: SingleTextNode,
+        decls: ModuleDecl list,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield moduleKeyword
+            yield! noa accessibility
+            yield identifier
+            yield equalsNode
+            yield! List.map ModuleDecl.Node decls
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val Module = moduleKeyword
+    member val Accessibility = accessibility
+    member val IsRecursive = isRecursive
+    member val Identifier = identifier
+    member val Equals = equalsNode
+    member val Declarations = decls
+
+/// Each case in this DU should have a container node
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type ModuleDecl =
+    | OpenList of OpenListNode
+    | HashDirectiveList of HashDirectiveListNode
+    | Attributes of ModuleDeclAttributesNode
+    | DeclExpr of Expr
+    | Exception of ExceptionDefnNode
+    | ExternBinding of ExternBindingNode
+    | TopLevelBinding of BindingNode
+    | ModuleAbbrev of ModuleAbbrevNode
+    | NestedModule of NestedModuleNode
+    | TypeDefn of TypeDefn
+    | Val of ValNode
+
+    static member Node(x: ModuleDecl) : Node =
+        match x with
+        | OpenList n -> n
+        | HashDirectiveList n -> n
+        | Attributes n -> n
+        | DeclExpr e -> Expr.Node e
+        | Exception n -> n
+        | ExternBinding n -> n
+        | TopLevelBinding n -> n
+        | ModuleAbbrev n -> n
+        | NestedModule n -> n
+        | TypeDefn t -> TypeDefn.Node t
+        | Val n -> n
+
+/// Example: `: int` — the explicit return type annotation on a binding (the colon token + type).
+type BindingReturnInfoNode(colon: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield colon; yield Type.Node t |]
+    member val Colon = colon
+    member val Type = t
+
+/// Example: `let inline private f<'T> (x: 'T) : int = ...` — a value/function/member binding.
+/// Covers `let`, `use`, `and`, `member`, `static member`, etc. depending on <c>LeadingKeyword</c>.
+type BindingNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode,
+        isMutable: bool,
+        inlineNode: SingleTextNode option,
+        accessibility: SingleTextNode option,
+        functionName: Choice<IdentListNode, Pattern>,
+        genericTypeParameters: TyparDecls option,
+        parameters: Pattern list,
+        returnType: BindingReturnInfoNode option,
+        equals: SingleTextNode,
+        expr: Expr,
+        inKeyword: SingleTextNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val IsMutable = isMutable
+    member val Inline = inlineNode
+    member val Accessibility = accessibility
+    member val FunctionName = functionName
+    member val GenericTypeParameters = genericTypeParameters
+    member val Parameters = parameters
+    member val ReturnType = returnType
+    member val Equals = equals
+    member val Expr = expr
+    member val In = inKeyword
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+
+            // `[<Literal>] let x` or `let [<Literal>] x`
+            match attributes with
+            | Some attributes when Position.posGt attributes.Range.Start leadingKeyword.Range.Start ->
+                yield leadingKeyword
+                yield attributes
+            | _ ->
+                yield! noa attributes
+                yield leadingKeyword
+
+            yield! noa inlineNode
+
+            let functionName: Node =
+                match functionName with
+                | Choice1Of2 n -> n
+                | Choice2Of2 p -> Pattern.Node p
+
+            // `member private x.P` or `member x.P with private get`
+            match accessibility with
+            | Some accessibility when Position.posGt accessibility.Range.Start functionName.Range.Start ->
+                yield functionName
+                yield accessibility
+            | _ ->
+                yield! noa accessibility
+                yield functionName
+
+            yield! noa (Option.map TyparDecls.Node genericTypeParameters)
+            yield! nodes (List.map Pattern.Node parameters)
+            yield! noa returnType
+            yield equals
+            yield Expr.Node expr
+            yield! noa inKeyword
+        |]
+
+/// A `let … and …` group of mutually recursive bindings, or a sequence of `use` bindings.
+type BindingListNode(bindings: BindingNode list, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield! nodes bindings |]
+    member val Bindings = bindings
+
+/// Example: `val mutable private name: int` — a field declaration inside a type definition.
+/// Used for record fields, union-case fields, and `val`-style class fields.
+type FieldNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode option,
+        mutableKeyword: SingleTextNode option,
+        accessibility: SingleTextNode option,
+        name: SingleTextNode option,
+        t: Type,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield! noa leadingKeyword
+            yield! noa mutableKeyword
+            yield! noa accessibility
+            yield! noa name
+            yield Type.Node t
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val MutableKeyword = mutableKeyword
+    member val Accessibility = accessibility
+    member val Name = name
+    member val Type = t
+
+/// Example: `...Source` — a spread of an existing record type into a record type definition.
+type TypeSpreadNode(dots: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield dots; yield Type.Node t |]
+    member val Dots = dots
+    member val Type = t
+
+/// A single item inside the record representation of a type definition, in source order.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type TypeDefnRecordFieldOrSpread =
+    | Field of FieldNode
+    | Spread of TypeSpreadNode
+
+    static member Node(item: TypeDefnRecordFieldOrSpread) : Node =
+        match item with
+        | Field n -> n
+        | Spread n -> n
+
+/// Example: `| MyCase of int * string` — a discriminated union case declaration.
+type UnionCaseNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        bar: SingleTextNode option,
+        identifier: SingleTextNode,
+        ofKeyword: SingleTextNode option,
+        fields: FieldNode list,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa bar
+            yield! noa attributes
+            yield identifier
+            yield! noa ofKeyword
+            yield! nodes fields
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val Bar = bar
+    member val Identifier = identifier
+    member val OfKeyword = ofKeyword
+    member val Fields = fields
+
+/// The shared header of a type definition: `type` / `and` keyword, optional doc, attributes, name, type parameters,
+/// constraints, optional implicit constructor, and `=` / `with` tokens.
+/// Example: `type private MyType<'T when 'T: equality>(x: int) =`
+type TypeNameNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: SingleTextNode,
+        ao: SingleTextNode option,
+        identifier: Type,
+        typeParams: TyparDecls option,
+        constraints: TypeConstraint list,
+        implicitConstructor: ImplicitConstructorNode option,
+        equalsToken: SingleTextNode option,
+        withKeyword: SingleTextNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+
+            // `[<A>] type T` or `and [<A>] T`
+            match attributes with
+            | Some attributes when Position.posGt attributes.Range.Start leadingKeyword.Range.Start ->
+                yield leadingKeyword
+                yield attributes
+            | _ ->
+                yield! noa attributes
+                yield leadingKeyword
+
+            yield! noa ao
+
+            // `type T<'a>` or `type 'a T`
+            match typeParams with
+            | Some(TyparDecls.PostfixList _ as typeParams) ->
+                yield Type.Node identifier
+                yield TyparDecls.Node typeParams
+            | Some typeParams ->
+                yield TyparDecls.Node typeParams
+                yield Type.Node identifier
+            | None -> yield Type.Node identifier
+
+            yield! List.map TypeConstraint.Node constraints
+            yield! noa implicitConstructor
+            yield! noa equalsToken
+            yield! noa withKeyword
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val IsFirstType = leadingKeyword.Text = "type"
+    member val LeadingKeyword = leadingKeyword
+    member val Accessibility = ao
+    member val Identifier = identifier
+    member val TypeParameters = typeParams
+    member val Constraints = constraints
+    member val ImplicitConstructor = implicitConstructor
+    member val EqualsToken = equalsToken
+    member val WithKeyword = withKeyword
+
+/// Interface implemented by all type-definition node types that carry a type name and a
+/// member list. Used to access the common parts of a type definition (its header and
+/// members) without matching on every <see cref="TypeDefn"/> case.
+type ITypeDefn =
+    abstract member TypeName: TypeNameNode
+    abstract member Members: MemberDefn list
+
+/// Example: `| Red = 0` — a single enum case declaration.
+type EnumCaseNode
+    (
+        xmlDoc: XmlDocNode option,
+        bar: SingleTextNode option,
+        attributes: MultipleAttributeListNode option,
+        identifier: SingleTextNode,
+        equals: SingleTextNode,
+        constant: Expr,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa bar
+            yield identifier
+            yield equals
+            yield Expr.Node constant
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Bar = bar
+    member val Attributes = attributes
+    member val Identifier = identifier
+    member val Equals = equals
+    member val Constant = constant
+
+/// Example: `type Color = Red | Green | Blue` — an enum-style type definition with integer-valued cases.
+type TypeDefnEnumNode(typeNameNode, enumCases: EnumCaseNode list, members: MemberDefn list, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield typeNameNode
+            yield! nodes enumCases
+            yield! nodes (List.map MemberDefn.Node members)
+        |]
+
+    member val EnumCases = enumCases
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Example: `type Result<'T> = Ok of 'T | Error of string` — a discriminated union type definition.
+type TypeDefnUnionNode
+    (typeNameNode, accessibility: SingleTextNode option, unionCases: UnionCaseNode list, members: MemberDefn list, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield typeNameNode
+            yield! noa accessibility
+            yield! nodes unionCases
+            yield! nodes (List.map MemberDefn.Node members)
+        |]
+
+    member val Accessibility = accessibility
+    member val UnionCases = unionCases
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Example: `type Point = { X: float; Y: float }` — a record type definition.
+type TypeDefnRecordNode
+    (
+        typeNameNode,
+        accessibility: SingleTextNode option,
+        openingBrace: SingleTextNode,
+        fields: TypeDefnRecordFieldOrSpread list,
+        closingBrace: SingleTextNode,
+        members,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield typeNameNode
+            yield! noa accessibility
+            yield openingBrace
+            yield! List.map TypeDefnRecordFieldOrSpread.Node fields
+            yield closingBrace
+            yield! nodes (List.map MemberDefn.Node members)
+        |]
+
+    member val Accessibility = accessibility
+    member val OpeningBrace = openingBrace
+    member val Fields = fields
+    member val ClosingBrace = closingBrace
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Example: `type Alias = OtherType` — a type abbreviation.
+type TypeDefnAbbrevNode(typeNameNode, t: Type, members, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield typeNameNode
+            yield Type.Node t
+            yield! nodes (List.map MemberDefn.Node members)
+        |]
+
+    member val Type = t
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Example: `as self` — the self-identifier binding at the end of an implicit constructor parameter list.
+type AsSelfIdentifierNode(asNode: SingleTextNode, self: SingleTextNode, range) =
+    inherit NodeBase(range)
+    override val Children = [| yield (asNode :> Node); yield self |]
+    member val As = asNode
+    member val Self = self
+
+/// Example: `(x: int, y: string) as self` — the primary constructor definition directly following the type name.
+type ImplicitConstructorNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        accessibility: SingleTextNode option,
+        pat: Pattern,
+        self: AsSelfIdentifierNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield! noa accessibility
+            yield Pattern.Node pat
+            yield! noa self
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val Accessibility = accessibility
+    member val Pattern = pat
+    member val Self = self
+
+/// The body of a `class … end` / `struct … end` / `interface … end` explicit type definition block.
+type TypeDefnExplicitBodyNode(kind: SingleTextNode, members: MemberDefn list, endNode: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield kind; yield! nodes (List.map MemberDefn.Node members); yield endNode |]
+
+    member val Kind = kind
+    member val Members = members
+    member val End = endNode
+
+/// Example: `type MyClass() = class … end` — a type definition using an explicit `class`/`struct`/`interface` block.
+type TypeDefnExplicitNode(typeNameNode, body: TypeDefnExplicitBodyNode, members, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield typeNameNode
+            yield body
+            yield! nodes (List.map MemberDefn.Node members)
+        |]
+
+    member val Body = body
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Example: `type MyClass with` — a type augmentation (intrinsic extension) adding members to an existing type.
+type TypeDefnAugmentationNode(typeNameNode, members, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield typeNameNode; yield! (List.map MemberDefn.Node members) |]
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Example: `type MyDelegate = delegate of int * string -> bool` — a delegate type declaration.
+type TypeDefnDelegateNode(typeNameNode, delegateNode: SingleTextNode, typeList: TypeFunsNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield typeNameNode; yield delegateNode; yield typeList |]
+
+    member val DelegateNode = delegateNode
+    member val TypeList = typeList
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = List.empty
+
+/// A regular type definition (class, interface, or abstract class without an explicit `class … end` block).
+/// Example: `type MyClass() =\n    member _.Foo() = …`
+type TypeDefnRegularNode(typeNameNode, members, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield typeNameNode; yield! List.map MemberDefn.Node members |]
+
+    interface ITypeDefn with
+        member val TypeName = typeNameNode
+        member val Members = members
+
+/// Discriminated union of all F# type-definition forms in the Oak representation.
+/// <c>None</c> is used for a bare type name with no body (e.g. <c>type T</c> in a signature);
+/// all other cases wrap a dedicated node type that also implements <see cref="ITypeDefn"/>.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type TypeDefn =
+    | Enum of TypeDefnEnumNode
+    | Union of TypeDefnUnionNode
+    | Record of TypeDefnRecordNode
+    | None of TypeNameNode
+    | Abbrev of TypeDefnAbbrevNode
+    | Explicit of TypeDefnExplicitNode
+    | Augmentation of TypeDefnAugmentationNode
+    | Delegate of TypeDefnDelegateNode
+    | Regular of TypeDefnRegularNode
+
+    static member Node(x: TypeDefn) : Node =
+        match x with
+        | Enum n -> n
+        | Union n -> n
+        | Record n -> n
+        | None n -> n
+        | Abbrev n -> n
+        | Explicit n -> n
+        | Augmentation n -> n
+        | Delegate n -> n
+        | Regular n -> n
+
+    static member TypeDefnNode(x: TypeDefn) : ITypeDefn =
+        match x with
+        | Enum n -> n
+        | Union n -> n
+        | Record n -> n
+        | None n ->
+            { new ITypeDefn with
+                member _.TypeName = n
+                member _.Members = []
+            }
+        | Abbrev n -> n
+        | Explicit n -> n
+        | Augmentation n -> n
+        | Delegate n -> n
+        | Regular n -> n
+
+/// Example: `inherit Base()` — an `inherit` member declaration inside a class body that specifies the base class.
+type MemberDefnInheritNode(inheritKeyword: SingleTextNode, baseType: Type, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield inheritKeyword; yield Type.Node baseType |]
+
+    member val Inherit = inheritKeyword
+    member val BaseType = baseType
+
+/// Secondary constructor
+/// new (pat: type) = expr
+type MemberDefnExplicitCtorNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        accessibility: SingleTextNode option,
+        newKeyword: SingleTextNode,
+        pat: Pattern,
+        alias: SingleTextNode option,
+        equals: SingleTextNode,
+        expr: Expr,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield! noa accessibility
+            yield newKeyword
+            yield Pattern.Node pat
+            yield! noa alias
+            yield equals
+            yield Expr.Node expr
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val Accessibility = accessibility
+    member val New = newKeyword
+    member val Pattern = pat
+    member val Alias = alias
+    member val Equals = equals
+    member val Expr = expr
+
+/// Example: `interface IDisposable with member _.Dispose() = ()` — an `interface` implementation clause inside a class or struct definition.
+type MemberDefnInterfaceNode
+    (interfaceNode: SingleTextNode, t: Type, withNode: SingleTextNode option, members: MemberDefn list, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield interfaceNode
+            yield Type.Node t
+            yield! noa withNode
+            yield! List.map MemberDefn.Node members
+        |]
+
+    member val Interface = interfaceNode
+    member val Type = t
+    member val With = withNode
+    member val Members = members
+
+/// Example: `member val Name = "" with get, set` — an auto-implemented property that generates a backing field automatically.
+type MemberDefnAutoPropertyNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode,
+        accessibility: SingleTextNode option,
+        identifier: SingleTextNode,
+        t: Type option,
+        equals: SingleTextNode,
+        expr: Expr,
+        withGetSet: MultipleTextsNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield leadingKeyword
+            yield! noa accessibility
+            yield identifier
+            yield! noa (Option.map Type.Node t)
+            yield equals
+            yield Expr.Node expr
+            yield! noa withGetSet
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val Accessibility = accessibility
+    member val Identifier = identifier
+    member val Type = t
+    member val Equals = equals
+    member val Expr = expr
+    member val WithGetSet = withGetSet
+
+/// Example: `abstract member Area: float` — an abstract member declaration specifying a name and type signature.
+type MemberDefnAbstractSlotNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode,
+        identifier: SingleTextNode,
+        typeParams: TyparDecls option,
+        t: Type,
+        withGetSet: MultipleTextsNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield leadingKeyword
+            yield identifier
+            yield! noa (Option.map TyparDecls.Node typeParams)
+            yield Type.Node t
+            yield! noa withGetSet
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val Identifier = identifier
+    member val TypeParams = typeParams
+    member val Type = t
+    member val WithGetSet = withGetSet
+
+/// A single `get` or `set` accessor body inside a `member … with get/set` property declaration.
+type PropertyGetSetBindingNode
+    (
+        inlineNode: SingleTextNode option,
+        attributes: MultipleAttributeListNode option,
+        accessibility: SingleTextNode option,
+        leadingKeyword: SingleTextNode,
+        parameters: Pattern list,
+        returnType: BindingReturnInfoNode option,
+        equals: SingleTextNode,
+        expr: Expr,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa inlineNode
+            yield! noa attributes
+            yield! noa accessibility
+            yield leadingKeyword
+            yield! List.map Pattern.Node parameters
+            yield! noa returnType
+            yield equals
+            yield Expr.Node expr
+        |]
+
+    member val Inline = inlineNode
+    member val Attributes = attributes
+    member val Accessibility = accessibility
+    member val LeadingKeyword = leadingKeyword
+    member val Parameters = parameters
+    member val ReturnType = returnType
+    member val Equals = equals
+    member val Expr = expr
+
+/// Example: `member x.Prop with get() = … and set v = …` — a property member with explicit `get` and/or `set` accessor bodies.
+type MemberDefnPropertyGetSetNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode,
+        inlineNode: SingleTextNode option,
+        accessibility: SingleTextNode option,
+        memberName: IdentListNode,
+        withKeyword: SingleTextNode,
+        firstBinding: PropertyGetSetBindingNode,
+        andKeyword: SingleTextNode option,
+        lastBinding: PropertyGetSetBindingNode option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield leadingKeyword
+            yield! noa accessibility
+            yield memberName
+            yield withKeyword
+            yield firstBinding
+            yield! noa andKeyword
+            yield! noa lastBinding
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val Inline = inlineNode
+    member val Accessibility = accessibility
+    member val MemberName = memberName
+    member val WithKeyword = withKeyword
+    member val FirstBinding = firstBinding
+    member val AndKeyword = andKeyword
+    member val LastBinding = lastBinding
+
+/// Example: `val mutable x: int` — a value declaration in a class or signature file, optionally mutable and with an initial expression.
+type ValNode
+    (
+        xmlDoc: XmlDocNode option,
+        attributes: MultipleAttributeListNode option,
+        leadingKeyword: MultipleTextsNode option,
+        inlineNode: SingleTextNode option,
+        isMutable: bool,
+        accessibility: SingleTextNode option,
+        identifier: SingleTextNode,
+        typeParams: TyparDecls option,
+        t: Type,
+        equals: SingleTextNode option,
+        eo: Expr option,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa xmlDoc
+            yield! noa attributes
+            yield! noa leadingKeyword
+            yield! noa accessibility
+            yield identifier
+            yield! noa (Option.map TyparDecls.Node typeParams)
+            yield Type.Node t
+            yield! noa equals
+            yield! noa (Option.map Expr.Node eo)
+        |]
+
+    member val XmlDoc = xmlDoc
+    member val Attributes = attributes
+    member val LeadingKeyword = leadingKeyword
+    member val Inline = inlineNode
+    member val IsMutable = isMutable
+    member val Accessibility = accessibility
+    member val Identifier = identifier
+    member val TypeParams = typeParams
+    member val Type = t
+    member val Equals = equals
+    member val Expr = eo
+
+/// Example: `abstract member Name: string with get, set` — a `val` declaration in a signature used as an abstract or interface member.
+type MemberDefnSigMemberNode(valNode: ValNode, withGetSet: MultipleTextsNode option, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield valNode; yield! noa withGetSet |]
+    member val Val = valNode
+    member val WithGetSet = withGetSet
+
+/// Discriminated union of all member definitions that can appear inside a type body.
+/// Covers everything from <c>inherit</c> and <c>val</c> fields to explicit constructors,
+/// abstract slots, auto-properties, and interface implementations.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type MemberDefn =
+    | ImplicitInherit of InheritConstructor
+    | Inherit of MemberDefnInheritNode
+    | ValField of FieldNode
+    | Member of BindingNode
+    | ExternBinding of ExternBindingNode
+    | DoExpr of ExprSingleNode
+    | LetBinding of BindingListNode
+    | ExplicitCtor of MemberDefnExplicitCtorNode
+    | Interface of MemberDefnInterfaceNode
+    | AutoProperty of MemberDefnAutoPropertyNode
+    | AbstractSlot of MemberDefnAbstractSlotNode
+    | PropertyGetSet of MemberDefnPropertyGetSetNode
+    | SigMember of MemberDefnSigMemberNode
+
+    static member Node(md: MemberDefn) : Node =
+        match md with
+        | ImplicitInherit n -> InheritConstructor.Node n
+        | Inherit n -> n
+        | ValField n -> n
+        | Member n -> n
+        | ExternBinding n -> n
+        | DoExpr n -> n
+        | LetBinding n -> n
+        | ExplicitCtor n -> n
+        | Interface n -> n
+        | AutoProperty n -> n
+        | AbstractSlot n -> n
+        | PropertyGetSet n -> n
+        | SigMember n -> n
+
+/// Example: `()` — a unit value consisting of an opening and closing parenthesis.
+type UnitNode(openingParen: SingleTextNode, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield openingParen; yield closingParen |]
+    member val OpeningParen = openingParen
+    member val ClosingParen = closingParen
+
+/// Example: `1.0<m/s>` — a numeric constant annotated with a unit of measure.
+type ConstantMeasureNode(constant: Constant, measure: UnitOfMeasureNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Constant.Node constant; yield measure |]
+    member val Constant = constant
+    member val Measure = measure
+
+/// Discriminated union for the three forms of constant literal in the Oak representation.
+/// <c>FromText</c> covers all ordinary literals (integers, strings, booleans, etc.);
+/// <c>Unit</c> is the <c>()</c> literal; <c>Measure</c> is a numeric literal with a unit annotation.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type Constant =
+    | FromText of SingleTextNode
+    | Unit of UnitNode
+    | Measure of ConstantMeasureNode
+
+    static member Node(c: Constant) : NodeBase =
+        match c with
+        | FromText n -> n
+        | Unit n -> n
+        | Measure n -> n
+
+/// Example: `'T` or `[<SomeAttr>] 'T & IDisposable` — a type parameter declaration with optional attributes
+/// and optional intersection constraints (F# 8+). Used in `<'T>` or `('T)` postfix/prefix type parameter lists.
+type TyparDeclNode
+    (
+        attributes: MultipleAttributeListNode option,
+        typar: SingleTextNode,
+        intersectionConstraints: Choice<Type, SingleTextNode> list,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield! noa attributes
+            yield typar
+            yield!
+                List.map
+                    (function
+                    | Choice1Of2 t -> Type.Node t
+                    | Choice2Of2 amp -> amp :> Node)
+                    intersectionConstraints
+        |]
+
+    member val Attributes = attributes
+    member val TypeParameter = typar
+    member val IntersectionConstraints = intersectionConstraints
+
+/// Example: `<'T, 'U when 'T: equality>` — a postfix (angle-bracket) list of type parameter declarations with constraints.
+type TyparDeclsPostfixListNode
+    (
+        lessThan: SingleTextNode,
+        decls: TyparDeclNode list,
+        constraints: TypeConstraint list,
+        greaterThan: SingleTextNode,
+        range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield lessThan
+            yield! nodes decls
+            yield! List.map TypeConstraint.Node constraints
+            yield greaterThan
+        |]
+
+    member val LessThan = lessThan
+    member val Decls = decls
+    member val Constraints = constraints
+    member val GreaterThan = greaterThan
+
+/// Example: `('T, 'U)` — a prefix (parenthesised) list of type parameter declarations.
+type TyparDeclsPrefixListNode
+    (openingParen: SingleTextNode, decls: TyparDeclNode list, closingParen: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield openingParen; yield! nodes decls; yield closingParen |]
+    member val OpeningParen = openingParen
+    member val Decls = decls
+    member val ClosingParen = closingParen
+
+/// Discriminated union for the three syntactic forms of type-parameter declaration.
+/// <c>PostfixList</c> is the <c>{'T, 'U}</c> style; <c>PrefixList</c> is <c>('T, 'U)</c>;
+/// <c>SinglePrefix</c> is a bare <c>'T</c> in contexts where only one parameter is present.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type TyparDecls =
+    | PostfixList of TyparDeclsPostfixListNode
+    | PrefixList of TyparDeclsPrefixListNode
+    | SinglePrefix of TyparDeclNode
+
+    static member Node(td: TyparDecls) : Node =
+        match td with
+        | PostfixList n -> n
+        | PrefixList n -> n
+        | SinglePrefix n -> n
+
+/// Example: `'T: comparison` or `'T: null` — a simple single-token type constraint.
+type TypeConstraintSingleNode(typar: SingleTextNode, kind: SingleTextNode, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield typar; yield kind |]
+    member val Typar = typar
+    member val Kind = kind
+
+/// Example: `default 'T: int` — a default type constraint used in statically-resolved type parameters.
+type TypeConstraintDefaultsToTypeNode(defaultNode: SingleTextNode, typar: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield defaultNode; yield typar; yield Type.Node t |]
+    member val Default = defaultNode
+    member val Typar = typar
+    member val Type = t
+
+/// Example: `'T :> IDisposable` — a subtype constraint.
+type TypeConstraintSubtypeOfTypeNode(typar: SingleTextNode, t: Type, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield typar; yield Type.Node t |]
+    member val Typar = typar
+    member val Type = t
+
+/// Example: `'T: (member Foo: int)` — a member constraint on a statically resolved type parameter.
+type TypeConstraintSupportsMemberNode(t: Type, memberSig: MemberDefn, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield Type.Node t |]
+    member val Type = t
+    member val MemberSig = memberSig
+
+/// Example: `'T: enum<int>` or `'T: delegate<int, string>` — an enum or delegate constraint on a type parameter.
+type TypeConstraintEnumOrDelegateNode(typar: SingleTextNode, verb: string, ts: Type list, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield typar; yield! List.map Type.Node ts |]
+    member val Typar = typar
+    member val Verb = verb
+    member val Types = ts
+
+/// `'T: not null` in `type C<'T when 'T: not null> = class end`
+type TypeConstraintWhereNotSupportsNull
+    (typar: SingleTextNode, colon: SingleTextNode, notNode: SingleTextNode, nullNode: SingleTextNode, range)
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield typar; yield colon; yield notNode; yield nullNode |]
+    member val Typar = typar
+    member val Colon = colon
+    member val Not = notNode
+    member val Null = nullNode
+
+/// Discriminated union of all type-constraint forms that can appear in <c>when</c> clauses.
+/// Covers simple constraints (<c>'T: comparison</c>), subtype constraints (<c>'T :> T</c>),
+/// member constraints, enum/delegate constraints, and F# 9 null-related constraints.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type TypeConstraint =
+    | Single of TypeConstraintSingleNode
+    | DefaultsToType of TypeConstraintDefaultsToTypeNode
+    | SubtypeOfType of TypeConstraintSubtypeOfTypeNode
+    | SupportsMember of TypeConstraintSupportsMemberNode
+    | EnumOrDelegate of TypeConstraintEnumOrDelegateNode
+    | WhereSelfConstrained of Type
+    | WhereNotSupportsNull of TypeConstraintWhereNotSupportsNull
+
+    static member Node(tc: TypeConstraint) : Node =
+        match tc with
+        | Single n -> n
+        | DefaultsToType n -> n
+        | SubtypeOfType n -> n
+        | SupportsMember n -> n
+        | EnumOrDelegate n -> n
+        | WhereSelfConstrained t -> Type.Node t
+        | WhereNotSupportsNull n -> n
+
+/// Example: `<m/s^2>` — a unit-of-measure annotation enclosed in angle brackets, used in type annotations.
+type UnitOfMeasureNode(lessThan: SingleTextNode, measure: Measure, greaterThan: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield lessThan; yield Measure.Node measure; yield greaterThan |]
+
+    member val LessThan = lessThan
+    member val Measure = measure
+    member val GreaterThan = greaterThan
+
+/// Example: `m * s` or `m / s` — a binary operator expression between two unit-of-measure terms.
+type MeasureOperatorNode(lhs: Measure, operator: SingleTextNode, rhs: Measure, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield Measure.Node lhs; yield operator; yield Measure.Node rhs |]
+
+    member val LeftHandSide = lhs
+    member val Operator = operator
+    member val RightHandSide = rhs
+
+/// Example: `m / s` or `1 / s` (when <c>LeftHandSide</c> is <c>None</c>, represents the reciprocal `/ s`).
+type MeasureDivideNode(lhs: Measure option, operator: SingleTextNode, rhs: Measure, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            match lhs with
+            | Some n -> yield Measure.Node n
+            | None -> ()
+            yield operator
+            yield Measure.Node rhs
+        |]
+
+    member val LeftHandSide = lhs
+    member val Operator = operator
+    member val RightHandSide = rhs
+
+/// Example: `m^2` — a unit-of-measure raised to a rational power.
+type MeasurePowerNode(measure: Measure, caret: SingleTextNode, exponent: RationalConstNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield Measure.Node measure
+            yield caret
+            yield RationalConstNode.Node exponent
+        |]
+
+    member val Measure = measure
+    member val Caret = caret
+    member val Exponent = exponent
+
+/// Example: `m s` — a sequence of juxtaposed unit-of-measure terms (implicit multiplication).
+type MeasureSequenceNode(measures: Measure list, range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield! List.map Measure.Node measures |]
+    member val Measures = measures
+
+/// Example: `(m * s)` — a parenthesised unit-of-measure expression for grouping.
+type MeasureParenNode(openingParen: SingleTextNode, measure: Measure, closingParen: SingleTextNode, range) =
+    inherit NodeBase(range)
+
+    override val Children: Node array = [| yield openingParen; yield Measure.Node measure; yield closingParen |]
+
+    member val OpeningParen = openingParen
+    member val Measure = measure
+    member val ClosingParen = closingParen
+
+/// Example: `(3/2)` — a rational-number exponent in a unit-of-measure power expression such as `m^(3/2)`.
+type RationalNode
+    (
+        openingParen: SingleTextNode,
+        numerator: SingleTextNode,
+        divOp: SingleTextNode,
+        denominator: SingleTextNode,
+        closingParen: SingleTextNode,
+        range: range
+    )
+    =
+    inherit NodeBase(range)
+
+    override val Children: Node array =
+        [|
+            yield openingParen
+            yield numerator
+            yield divOp
+            yield denominator
+            yield closingParen
+        |]
+
+    member val OpeningParen = openingParen
+    member val Numerator = numerator
+    member val DivOp = divOp
+    member val Denominator = denominator
+    member val ClosingParen = closingParen
+
+/// Example: `-2` or `-(3/2)` — a negated rational constant used as a unit-of-measure exponent.
+type NegateRationalNode(minus: SingleTextNode, rationalConst: RationalConstNode, range: range) =
+    inherit NodeBase(range)
+    override val Children: Node array = [| yield minus; yield RationalConstNode.Node rationalConst |]
+
+    member val Minus = minus
+    member val Rational = rationalConst
+
+/// Discriminated union for the three forms of a rational-number exponent in a unit-of-measure
+/// type annotation (e.g. <c>m/s^2</c>). An exponent can be a plain integer, a rational
+/// fraction <c>3/2</c>, or a negated form of either.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type RationalConstNode =
+    | Integer of SingleTextNode
+    | Rational of RationalNode
+    | Negate of NegateRationalNode
+
+    static member Node(r: RationalConstNode) : Node =
+        match r with
+        | Integer n -> n
+        | Rational n -> n
+        | Negate n -> n
+
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type Measure =
+    | Single of SingleTextNode
+    | Operator of MeasureOperatorNode
+    | Divide of MeasureDivideNode
+    | Power of MeasurePowerNode
+    | Multiple of IdentListNode
+    | Seq of MeasureSequenceNode
+    | Paren of MeasureParenNode
+
+    static member Node(m: Measure) : Node =
+        match m with
+        | Single n -> n
+        | Operator n -> n
+        | Divide n -> n
+        | Power n -> n
+        | Multiple n -> n
+        | Seq n -> n
+        | Paren n -> n

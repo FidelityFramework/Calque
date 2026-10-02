@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Calque</AssemblyName>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>calque</ToolCommandName>
+    <PackageId>Calque</PackageId>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Formatting.fs" />
+    <Compile Include="Cli.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Calque.Core/Calque.Core.fsproj" />
+    <PackageReference Include="FSharp.Core" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net10.0": {
+      "FSharp.Core": {
+        "type": "Direct",
+        "requested": "[10.1.401, )",
+        "resolved": "10.1.401",
+        "contentHash": "IGqjL9U8pQl7CaCpFP3f5slZMduE8c7ZBx7HycAQ9dc1tawyniNyw7Fh6L2cShIoQDcaDL+S8/kokhWs8WwnBQ=="
+      },
+      "FsLexYacc": {
+        "type": "Direct",
+        "requested": "[13.0.0, )",
+        "resolved": "13.0.0",
+        "contentHash": "ag2jfK6BSK7NeXAAd608y0e2uTxf3GzEX/DGT+/JcxR6rXT3FXRdfta5gOEt85zYkUeRPppo2dc3W3wWvIbb2A==",
+        "dependencies": {
+          "FSharp.Core": "10.0.100",
+          "FsLexYacc.Runtime": "13.0.0"
+        }
+      },
+      "FsLexYacc.Runtime": {
+        "type": "Transitive",
+        "resolved": "13.0.0",
+        "contentHash": "LcqQCJB+0ihvS8O36uN8c1c3vusKNZONY5lMo31kuqwdCf+1BrnVgnmvq/KeWAm7KtyUfTxsjSjbUWzlBPugzw==",
+        "dependencies": {
+          "FSharp.Core": "10.0.100"
+        }
+      }
+    }
+  }
+}

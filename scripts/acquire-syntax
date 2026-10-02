@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fetch only the source files used by the syntax parser and its resource generator.
+# Namespace rewriting keeps this parser separate from any compiler service in its caller.
+calque_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+calque_pin=5e9647f158fe282462aba57ed83ada910a91b90e
+calque_manifest="$calque_root/scripts/syntax-files.txt"
+calque_requested=${1:-$calque_pin}
+if [[ "$calque_requested" != "$calque_pin" ]]; then
+  printf 'Calque syntax acquisition refuses the unreviewed commit %s.\n' "$calque_requested" >&2
+  exit 2
+fi
+
+calque_deps="$calque_root/.deps"
+calque_target="$calque_deps/$calque_pin"
+calque_manifest_hash=$(sha256sum "$calque_manifest" | cut -d ' ' -f 1)
+calque_previous_identity="$calque_pin namespace-and-line-refusal-v1 $calque_manifest_hash"
+calque_identity="$calque_pin namespace-line-refusal-net10-v2 $calque_manifest_hash"
+
+# Stable SDK 10.0.401 does not infer Tables.memoize's existing signature constraint.
+# State that non-null dictionary-key constraint explicitly; keep the API and implementation.
+calque_fix_memoize() {
+  perl - "$1" <<'PERL'
+use strict;
+use warnings;
+my $path = shift @ARGV;
+open my $input, '<', $path or die "Cannot read pinned memoize source: $!";
+local $/;
+my $text = <$input>;
+close $input;
+my $anchor = "module Tables =\n    let memoize f =\n";
+my $count = () = $text =~ /\Q$anchor\E/g;
+die "Pinned memoize implementation changed ($count matches).\n" unless $count == 1;
+my $replacement = "module Tables =\n    let memoize<'a, 'b when 'a: equality and 'a: not null> (f: 'a -> 'b) : 'a -> 'b =\n";
+$text =~ s/\Q$anchor\E/$replacement/;
+open my $output, '>', $path or die "Cannot adapt pinned memoize source: $!";
+print {$output} $text;
+close $output;
+PERL
+}
+
+calque_record_sources() {
+  (cd -- "$1" && while IFS= read -r calque_file; do
+    [[ -n "$calque_file" && "$calque_file" != \#* ]] || continue
+    sha256sum "$calque_file"
+  done < "$calque_manifest" > .calque-sha256.new)
+  mv -- "$1/.calque-sha256.new" "$1/.calque-sha256"
+  printf '%s\n' "$calque_identity" > "$1/.calque-source.new"
+  mv -- "$1/.calque-source.new" "$1/.calque-source"
+}
+mkdir -p -- "$calque_deps"
+exec 9>"$calque_deps/.calque-syntax.lock"
+flock -w 60 9
+
+if [[ -d "$calque_target" ]]; then
+  if [[ -f "$calque_target/.calque-source" ]] && [[ "$(cat "$calque_target/.calque-source")" == "$calque_identity" ]]; then
+    (cd -- "$calque_target" && sha256sum --check --status .calque-sha256)
+    exit 0
+  fi
+  if [[ -f "$calque_target/.calque-source" ]] && [[ "$(cat "$calque_target/.calque-source")" == "$calque_previous_identity" ]]; then
+    # Upgrade only our fully verified preceding acquisition, never an unknown or edited cache.
+    (cd -- "$calque_target" && sha256sum --check --status .calque-sha256)
+    calque_illib="$calque_target/src/Compiler/Utilities/illib.fs"
+    printf '%s  %s\n' '3704bd816c158d43991d49676af88a1964be9d84373c6aab6df2aea863fd69e1' \
+      "$calque_illib" | sha256sum --check --status
+    cp -- "$calque_illib" "$calque_illib.new"
+    calque_fix_memoize "$calque_illib.new"
+    mv -- "$calque_illib.new" "$calque_illib"
+    calque_record_sources "$calque_target"
+    exit 0
+  fi
+  printf 'Calque refuses an unverified parser directory: %s\n' "$calque_target" >&2
+  exit 2
+fi
+
+calque_stage=$(mktemp -d "$calque_deps/.calque-syntax.XXXXXXXX")
+trap 'rm -rf -- "$calque_stage"' EXIT
+calque_deadline=$((SECONDS + 240))
+while IFS= read -r calque_file; do
+  [[ -n "$calque_file" && "$calque_file" != \#* ]] || continue
+  if [[ "$calque_file" == /* || "$calque_file" == *..* || "$calque_file" == *\\* ]]; then
+    printf 'Unsafe syntax source path: %s\n' "$calque_file" >&2
+    exit 2
+  fi
+  mkdir -p -- "$calque_stage/$(dirname -- "$calque_file")"
+  if (( SECONDS >= calque_deadline )); then
+    printf 'Calque syntax acquisition exceeded its 240 second deadline.\n' >&2
+    exit 2
+  fi
+  calque_budget=$((calque_deadline - SECONDS))
+  timeout "$calque_budget" curl --fail --silent --show-error --location --connect-timeout 5 --max-time 15 --retry 1 \
+    "https://raw.githubusercontent.com/dotnet/fsharp/$calque_pin/$calque_file" \
+    --output "$calque_stage/$calque_file"
+  [[ -s "$calque_stage/$calque_file" ]]
+  if [[ "$calque_file" == src/Compiler/lex.fsl ]]; then
+    printf '%s  %s\n' '966f8cf59d5818d4dd3fbfc65952655873b0b349369ea3719240d8d999574f65' \
+      "$calque_stage/$calque_file" | sha256sum --check --status
+  fi
+  if [[ "$calque_file" == src/Compiler/Utilities/illib.fs ]]; then
+    printf '%s  %s\n' 'a20a894d83ba37a454ad8e0b86293f90ee2393c1a3f9fc139a5936569f093053' \
+      "$calque_stage/$calque_file" | sha256sum --check --status
+  fi
+  case "$calque_file" in
+    *.fs|*.fsi|*.fsl|*.fsy)
+      sed -i \
+        -e 's/namespace FSharp\.Build/namespace Calque.Syntax.Build/g' \
+        -e 's/FSharp\.Compiler/Calque.Syntax/g' \
+        -e 's/\[<TailCall>\]/[<Microsoft.FSharp.Core.TailCall>]/g' \
+        "$calque_stage/$calque_file"
+      ;;
+  esac
+done < "$calque_manifest"
+
+# The upstream lexer consumes line directives before constructing the AST. Refuse at that
+# existing token rule, where comments and strings are already distinguished by the parser.
+# The whole original file hash and exact anchor count prevent a drifted compiler patch.
+perl - "$calque_stage/src/Compiler/lex.fsl" <<'PERL'
+use strict;
+use warnings;
+my $path = shift @ARGV;
+open my $input, '<', $path or die "Cannot read pinned lexer: $!";
+local $/;
+my $text = <$input>;
+close $input;
+my $anchor = <<'RULE';
+ | ('#' anywhite* | "#line" anywhite+ ) digit+ anywhite* ('@'? "\"" [^'\n''\r''"']+ '"')? anywhite* newline
+     {  let pos = lexbuf.EndPos
+RULE
+my $count = () = $text =~ /\Q$anchor\E/g;
+die "Pinned line directive lexer rule changed ($count matches).\n" unless $count == 1;
+my $replacement = $anchor;
+$replacement =~ s/\{  let pos/\{  raise (System.NotSupportedException("Calque cannot yet format line directives (#line or #number)."))\n        let pos/;
+$text =~ s/\Q$anchor\E/$replacement/;
+open my $output, '>', $path or die "Cannot adapt pinned lexer: $!";
+print {$output} $text;
+close $output;
+PERL
+
+calque_fix_memoize "$calque_stage/src/Compiler/Utilities/illib.fs"
+calque_record_sources "$calque_stage"
+mv -- "$calque_stage" "$calque_target"
+trap - EXIT

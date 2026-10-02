@@ -1,0 +1,17 @@
+module LexicalBoundaries
+
+let ``distance travelled`` = 12.0
+let quoted = ``distance travelled``
+let text = "not a // comment or a 12.0<m> measure"
+let escaped = "a \"quote\" remains inside"
+let verbatim = @"a ""quote"" and // remain inside"
+// let fake = 9.81<m/s^2>
+(* outer comment
+   (* nested comment *) still outer
+*)
+let afterComment = 42
+let multiline = """a multiline string
+let fake = 12.0<m>
+"""
+let afterString = true
+let choose value = if value then 1 else 0

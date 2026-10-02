@@ -1,0 +1,6 @@
+let unfinished = 1.0<m/
+let following = 42
+let comparison = 1.0 < limit
+let followingComparison = false
+let wholeComparison = 1 < limit
+let afterWholeComparison = true

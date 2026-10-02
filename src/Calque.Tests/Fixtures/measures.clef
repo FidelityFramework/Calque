@@ -1,0 +1,22 @@
+module MeasuredMotion
+
+[<Measure>] type m
+[<Measure>] type s
+[<Measure>] type kg
+[<Measure>] type acceleration = m/s^2
+
+let distance = 12.0<m>
+let elapsed = 3.0<s>
+let speed (distance: float<m>) (elapsed: float<s>) : float<m/s> = distance / elapsed
+let acceleration = 9.81<m/s^2>
+let pressure = 101325.0<kg m^-1 s^-2>
+let identity (value: 'T) : 'T = value
+let values : list<float<m>> = [distance]
+let tiny = -1.25e-3<m>
+let qualified = 2.0<SI.m>
+let wholeDistance = 1<m>
+let wholeSpeed = 2<m/s>
+let inferredUnit = 1<_>
+let inferredReal = 0.0<_>
+let sameMeasure (value: float<'U>) : float<'U> = value
+let squared (value: float<'U>) : float<'U^2> = value * value

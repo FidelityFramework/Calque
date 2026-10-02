@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="src/Calque.Syntax.BuildTasks/Calque.Syntax.BuildTasks.fsproj" />
+  <Project Path="src/Calque.Syntax/Calque.Syntax.fsproj" />
+  <Project Path="src/Calque.Core/Calque.Core.fsproj" />
+  <Project Path="src/Calque.Incremental/Calque.Incremental.fsproj" />
+  <Project Path="src/Calque/Calque.fsproj" />
+  <Project Path="src/Calque.Tests/Calque.Tests.fsproj" />
+</Solution>

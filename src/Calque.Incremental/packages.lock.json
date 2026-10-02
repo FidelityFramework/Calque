@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net10.0": {
+      "Fidelity.FSharp.Incremental.Hosting": {
+        "type": "Direct",
+        "requested": "[0.1.0-preview.6, )",
+        "resolved": "0.1.0-preview.6",
+        "contentHash": "rEc6AAmjNh7ckoWM7Rw+EBPwDsAH2vjRbV4/dV0aFWZEJJkaHZP4zPR2iLaFIB11oasQBgxNGe6Hw1tL18Wpnw==",
+        "dependencies": {
+          "FSharp.Core": "10.1.401",
+          "Fidelity.FSharp.Incremental": "0.1.0-preview.6"
+        }
+      },
+      "FSharp.Core": {
+        "type": "Direct",
+        "requested": "[10.1.401, )",
+        "resolved": "10.1.401",
+        "contentHash": "IGqjL9U8pQl7CaCpFP3f5slZMduE8c7ZBx7HycAQ9dc1tawyniNyw7Fh6L2cShIoQDcaDL+S8/kokhWs8WwnBQ=="
+      },
+      "Fidelity.FSharp.Incremental": {
+        "type": "Transitive",
+        "resolved": "0.1.0-preview.6",
+        "contentHash": "gUbzjdThNhnidJsS2t+1PGjhmUlOrFAthYucZwjqVBEvVQzUpuc99PwxBKIoY1uvFUpszg+6Kj2fTr2oP4ve2Q==",
+        "dependencies": {
+          "FSharp.Core": "10.1.401"
+        }
+      },
+      "calque.core": {
+        "type": "Project",
+        "dependencies": {
+          "Calque.Syntax": "[0.1.0, )",
+          "FSharp.Core": "[10.1.401, )"
+        }
+      },
+      "calque.syntax": {
+        "type": "Project",
+        "dependencies": {
+          "FSharp.Core": "[10.1.401, )"
+        }
+      }
+    }
+  }
+}
