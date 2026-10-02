@@ -6,6 +6,7 @@ open Calque
 open Calque.Core
 open Calque.Syntax.Syntax
 
+
 // Clef expressions.md:2827-2853 specifies typed/raw quotations and rejects
 // splices. Numeric Selection section 4 uses native dimensioned quoted laws.
 // These fixtures exercise source preservation, not quotation evaluation.
