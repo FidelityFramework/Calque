@@ -325,12 +325,16 @@ let private substantialSource =
   [ for index in 1 .. 40 -> $"// value {index}\nlet value{index}=({index}+1)*2\n" ]
   |> String.concat "\n"
 
+let private conditionalSource =
+  "#if FIRST\n" + substantialSource + "#else\nlet fallback=0\n#endif\n"
+
 let private phaseFromName = function
   | "Parse" -> FormattingPhase.Parse
   | "Oak" -> FormattingPhase.Oak
   | "Trivia" -> FormattingPhase.Trivia
   | "Dialect" -> FormattingPhase.Dialect
   | "Print" -> FormattingPhase.Print
+  | "Merge" -> FormattingPhase.Merge
   | name -> failwithf "unknown checkpoint phase %s" name
 
 [<Test; CancelAfter(10000)>]
@@ -352,10 +356,11 @@ let ``format and parse workflows stay cold through source preparation and initia
   Assert.That(parseFailure, Is.SameAs stopped)
   Assert.That(checks, Is.EqualTo 2)
 
-[<TestCase("Parse"); TestCase("Oak"); TestCase("Trivia"); TestCase("Dialect"); TestCase("Print")>]
+[<TestCase("Parse"); TestCase("Oak"); TestCase("Trivia"); TestCase("Dialect"); TestCase("Print"); TestCase("Merge")>]
 [<CancelAfter(10000)>]
 let ``real formatting stops inside the selected phase without completing it`` phaseName =
   let target = phaseFromName phaseName
+  let source = if target = FormattingPhase.Merge then conditionalSource else substantialSource
   let stopped = FormattingStoppedException()
   let mutable checks = 0
   let checkpoint phase =
@@ -365,10 +370,56 @@ let ``real formatting stops inside the selected phase without completing it`` ph
   let result =
     Assert.Catch(Action(fun () ->
       CodeFormatter.FormatDocumentWithCheckpointAsync(checkpoint, (fun error -> obj.ReferenceEquals(error, stopped)),
-        false, substantialSource, FormatConfig.Default)
+        false, source, FormatConfig.Default)
       |> run |> ignore))
   Assert.That(result, Is.SameAs stopped, "the stop must not become a parse or source diagnostic")
-  Assert.That(checks, Is.EqualTo 12, "the real parser/walker/printer must not run the remainder")
+  Assert.That(checks, Is.EqualTo 12, "the real parser/walker/printer/merge must not run the remainder")
+
+[<TestCase("Parse"); TestCase("Print"); TestCase("Merge")>]
+[<CancelAfter(10000)>]
+let ``releasing the last real pipeline demand stops work before a same revision replacement`` phaseName =
+  let identity = document ()
+  let target = phaseFromName phaseName
+  let sourceText = if target = FormattingPhase.Merge then conditionalSource else substantialSource
+  let entered = signal ()
+  use resume = new ManualResetEventSlim(false)
+  let mutable preparations = 0
+  let mutable withdrawnChecks = 0
+  let mutable replacementChecks = 0
+  let inspect _ phase =
+    if phase = FormattingPhase.SourcePreparation then Interlocked.Increment(&preparations) |> ignore
+    if Volatile.Read(&preparations) <= 2 then
+      if phase = target && Interlocked.Increment(&withdrawnChecks) = 12 then
+        entered.TrySetResult() |> ignore
+        if not (resume.Wait(TimeSpan.FromSeconds 5.)) then failwith "last-demand checkpoint gate timed out"
+    else
+      Interlocked.Increment(&replacementChecks) |> ignore
+  let handle = DocumentFormatter.createWithCheckpoint settings identity inspect |> require
+  try
+    DocumentFormatter.start handle |> require
+    let source = snapshot identity 1UL sourceText
+    let first = DocumentFormatter.request source handle |> require
+    waitSignal entered
+    release first handle
+    DocumentFormatter.observe first handle |> run |> expectError FormatterError.Released
+    // No revision change or explicit cancellation can account for this stop.
+    // A new demand for the exact input must wait for the withdrawn attempt.
+    let replacement = DocumentFormatter.request source handle |> require
+    Assert.That(preparations, Is.EqualTo 2, "the held attempt must drain before a replacement prepares source")
+    Assert.That(replacementChecks, Is.Zero)
+    resume.Set()
+    let preview = DocumentFormatter.observe replacement handle |> run |> require
+    Assert.That(preview.Snapshot, Is.EqualTo source)
+    match preview.Outcome with
+    | FormatOutcome.Formatted _ -> ()
+    | other -> Assert.Fail(sprintf "same-revision demand was not formatted: %A" other)
+    Assert.That(withdrawnChecks, Is.EqualTo 12, "the last release must stop the real pipeline at its held checkpoint")
+    Assert.That(preparations, Is.EqualTo 4, "exactly one replacement performs its before/after preparation checks")
+    Assert.That(replacementChecks, Is.GreaterThan 0)
+    Assert.That(DocumentFormatter.drainDiagnostics handle, Is.Empty)
+  finally
+    resume.Set()
+    close handle
 
 [<TestCase("Parse"); TestCase("Print")>]
 [<CancelAfter(10000)>]
