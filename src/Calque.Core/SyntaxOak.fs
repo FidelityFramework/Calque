@@ -291,7 +291,7 @@ type Oak(parsedHashDirectives: ParsedHashDirectiveNode list, modulesOrNamespaces
 
     override val Children: Node array = [| yield! nodes parsedHashDirectives; yield! nodes modulesOrNamespaces |]
 
-/// Example: `#r "nuget: Newtonsoft.Json"` or `#load "Utils.fs"` — a hash directive at the file level.
+/// Example: `#r "Fidelity.Data.dll"` or `#load "Utils.fs"` — a hash directive at the file level.
 /// <c>Ident</c> is the directive keyword (e.g. `r`, `load`, `nowarn`); <c>Args</c> are its arguments.
 type ParsedHashDirectiveNode(ident: string, args: Choice<SingleTextNode, IdentListNode> list, range) =
     inherit NodeBase(range)
