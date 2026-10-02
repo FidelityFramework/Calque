@@ -76,12 +76,25 @@ typed host diagnostics even for withdrawn attempts. A result may be presented
 only for its current identity, with a further editor revision check before
 applying formatted text.
 
+The foundation carries explicit `WorkCancellation` to each evaluator, withdraws
+obsolete publication before cancellation, and joins evaluator and callback
+cleanup before replacing the same work. The production full-document formatter
+currently ignores that signal during parsing and printing. Its output is safely
+withdrawn, but it completes the running pipeline before replacement starts.
+A next step is cooperative checks between existing parse, Oak, trivia, dialect,
+print and merge phases. Every started conditional branch must still join, and a
+stop request must preserve genuine sibling failures. Interrupting within a
+synchronous phase is separate work; ambient cancellation must not detach it.
+
 This source-presentation path must proceed independently of Baker settlement,
 proof dispatch and target compilation. Incomplete editing buffers still need
 responsive syntax presentation when safe formatting is refused. The current API
 parses and formats whole documents or prints caller-authored Oak trees;
-incremental syntax/trivia reuse, markup results and editor integration remain
-undelivered. Edit coalescing, cooperative interruption of synchronous parsing and
+incremental syntax/trivia reuse and markup results remain undelivered. Lattice's
+development VS Code client now offers an explicit immutable preview through a
+selected Bozzetto Composer session, including unsaved-buffer identity checks.
+Saving/applying that preview and shared compiler overlays remain separate work.
+Edit coalescing, cooperative interruption of synchronous parsing and
 edit-to-visible-result latency budgets remain acceptance work: replacing shared
 work waits for older attempts to drain. Protocol lifecycle tests establish
 ownership and freshness, not a design-time performance budget.
