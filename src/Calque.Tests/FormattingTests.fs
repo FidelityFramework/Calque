@@ -83,6 +83,22 @@ let ``CLR casts null and object oriented syntax are refused`` source =
   | Error reason -> Assert.That(reason, Does.Contain "not permitted in Clef source")
   | Ok code -> Assert.Fail(sprintf "forbidden source was rewritten: %s" code)
 
+[<TestCase("let run () = task { return 42 }\n")>]
+[<TestCase("let idle () = task { }\n")>]
+[<TestCase("let run next = task {\n  let! value = next ()\n  return value + 1\n}\n")>]
+[<TestCase("let declaration = <@ task { return 42 } @>\n")>]
+let ``dotnet task computation expressions are refused`` source =
+  match Formatting.format source with
+  | Error reason -> Assert.That(reason, Does.Contain "'task computation expression' is not permitted in Clef source")
+  | Ok code -> Assert.Fail(sprintf "task source was rewritten: %s" code)
+
+[<TestCase("let task = 42\nlet next = task + 1\n")>]
+[<TestCase("type Job = { task: int }\nlet job = { task = 1 }\n")>]
+let ``a binding or field named task remains ordinary source`` source =
+  match Formatting.format source with
+  | Ok code -> Assert.That(code, Is.EqualTo source)
+  | Error reason -> Assert.Fail(sprintf "ordinary task name was refused: %s" reason)
+
 [<Test>]
 let ``inconclusive conditional coverage refuses valid source instead of dropping a branch`` () =
   let source = """module ConditionalCoverage

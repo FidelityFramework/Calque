@@ -3,7 +3,7 @@ module internal Calque.Core.SourceDialect
 open Calque.Core.SyntaxOak
 
 // Inspect syntax roles in the Oak, keeping strings, comments and quoted identifiers intact.
-// Clef has no CLR widening, nulls or object model. This guard refuses those parser forms;
+// Clef has no CLR widening, nulls, object model or .NET task. This guard refuses those parser forms;
 // it does not resolve names or decide what a qualified function call means.
 let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
   let unsupported text =
@@ -122,6 +122,11 @@ let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
     | :? PatIsInstNode -> refuse "type-test pattern"
     | :? ExprObjExprNode -> refuse "object expression"
     | :? ExprNewNode -> refuse "object constructor"
+    // Only the builder position names .NET task; a binding or field called task stays ordinary syntax.
+    | :? ExprNamedComputationNode as computation ->
+      match computation.Name with
+      | Expr.Ident builder when builder.Text = "task" -> refuse "task computation expression"
+      | _ -> ()
     | :? ExprTraitCallNode -> unsupported "compile-time member invocation"
     | :? TypeDefnRegularNode -> refuse "class or interface declaration"
     | :? TypeDefnExplicitBodyNode as body when body.Kind.Text = "class" || body.Kind.Text = "interface" ->

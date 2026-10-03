@@ -32,6 +32,10 @@ appearance. Future JavaScript targeting may need widening, but the intended
 direction is a principled source syntax with representation changes handled
 downstream near the target. Target support alone does not relax these rules.
 
+Clef likewise admits no .NET `task`. Calque refuses `task { ... }` computation
+expressions, including inside quotations; a binding or field named `task`
+remains ordinary source.
+
 Quotations are first-class source: preserve typed `<@ ... @>`, untyped
 `<@@ ... @@>` and nested quotation structure, comments and literal spelling.
 Their compile-time interpretation belongs to Clef; formatting does not evaluate

@@ -16,6 +16,8 @@ importing Fantomas's Git ancestry.
 - Do not translate Clef to F# text or claim the inherited parser validates all Clef.
 - Current Clef excludes nulls, CLR widening and OO syntax. Imperative bindings,
   loops and record updates remain valid; do not impose functional style.
+- Clef admits no .NET `task`. Refuse `task { ... }` computation expressions;
+  do not refuse an ordinary binding or field named `task`.
 - Treat HelloArty and HelloWayland as working compatibility evidence. Parser
   refusals can mark adapter gaps. Check Composer PRDs and the Clef spec before
   declaring a source form invalid, including compile-time member constraints.

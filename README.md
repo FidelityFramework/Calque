@@ -20,6 +20,8 @@ HelloArty and HelloWayland. Broader support requires a Clef parser adapter.
   structure and contents without evaluation. Quotation splices (`%expr` and
   `%%expr`) are refused under the current Clef contract; infix `%` remains valid.
 - Nulls, OO syntax and CLR widening such as `:> obj` are refused.
+- Clef admits no .NET `task`: `task { ... }` computation expressions are refused.
+  A binding or field named `task` remains ordinary source.
 
 ## Components and integration
 
