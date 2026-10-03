@@ -253,10 +253,13 @@ type IdentListNode(content: IdentifierOrDot list, range) =
 
 /// The most fundamental leaf node — a single token of source text (keyword, operator, identifier, punctuation, etc.).
 /// Examples: `let`, `=`, `->`, `(`, `myVar`.
-type SingleTextNode(idText: string, range: range) =
+type SingleTextNode(idText: string, range: range, ?isExpressionIdentifier: bool) =
     inherit NodeBase(range)
     let mutable cursor: pos option = None
     member val Text = idText
+    /// Preserve the expression role of a parsed name separately from fields,
+    /// declarations, literals and trivia using the same token representation.
+    member val IsExpressionIdentifier = defaultArg isExpressionIdentifier false
     override val Children = Array.empty
 
     /// Of all nodes, only a `SingleTextNode` holds the editor's cursor, see `Trivia.insertCursor`.

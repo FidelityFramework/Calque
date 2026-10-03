@@ -6,11 +6,12 @@ The first slice retains Oak, the source-aware trivia pipeline and the printer,
 with a small API and CLI. The inherited parser currently accepts a guarded
 subset of Clef syntax. Unsupported constructs are refused before file writes;
 a dedicated Clef parser adapter remains required for broader language support.
-For now, this is F# formatting with explicit Clef exclusions, rather than a
-complete language validator. HelloArty and HelloWayland are working compatibility
-examples over a developing language surface; an inherited-parser refusal marks
-a formatter gap and does not make those programs invalid. Imperative bindings,
-loops and record updates remain ordinary source, with their order preserved.
+The bootstrap uses an inherited F# parser with explicit Clef source checks; it
+does not validate the complete Clef language. HelloArty and HelloWayland are
+working compatibility examples over a developing language surface; an inherited
+parser refusal marks a formatter gap and does not make those programs invalid.
+Imperative bindings, loops and record updates remain ordinary source, with their
+order preserved.
 
 ## Components and responsibilities
 
@@ -35,6 +36,41 @@ downstream near the target. Target support alone does not relax these rules.
 Clef likewise admits no .NET `task`. Calque refuses `task { ... }` computation
 expressions, including inside quotations; a binding or field named `task`
 remains ordinary source.
+
+### Native boundary source
+
+Calque preserves native boundary carriers such as `CHandle` and `FnPtr` without
+lowering them to raw addresses or managed interop wrappers. For example, the
+formatter preserves these source forms:
+
+```clef
+type Context = {
+  Entry: FnPtr<int -> int>
+  Handle: option<CHandle<unit>>
+}
+
+let callback value = value
+let context = { Entry = FnPtr.ofFunction callback; Handle = None }
+```
+
+Formatting this source does not validate the callback, handle ownership or
+lifetimes. CCS/Baker owns type checking, boundary obligations and proof
+settlement, including the flat closure and bounded pointer mechanisms.
+Composer orchestrates witnessing and target execution of that settled contract.
+
+The syntax guard refuses recognized raw-pointer surfaces (`NativePtr`,
+`nativeptr`, `voidptr`, `System.IntPtr`, `fixed`, `stackalloc` and unary `&&`),
+`Unchecked` construction, boxing, runtime type reification and managed P/Invoke.
+It inspects syntax roles, including qualified references, imports, module
+aliases, quoted bodies and conditional branches. Comments, literal text,
+escaped names and ordinary record fields remain source text; arrays, `async`,
+numeric literal spelling and infix Boolean `&&` remain available to format.
+
+A refusal produces a diagnostic before any requested file is written. There is
+no formatting fallback that enables these mechanisms or translates them into
+substitute Clef source. Refusal regressions pass forbidden forms as fixture text
+to the formatter and verify that every source file in the batch remains
+unchanged; they do not compile or execute that text as unsafe interop.
 
 Quotations are first-class source: preserve typed `<@ ... @>`, untyped
 `<@@ ... @@>` and nested quotation structure, comments and literal spelling.

@@ -91,6 +91,12 @@ let ``all input files must parse before any source file is written`` () =
 [<TestCase("let f<'T when 'T : delegate<unit, unit>> () = ()\n")>]
 [<TestCase("type Holder(value: int) =\n  member _.Value = value\n")>]
 [<TestCase("let value = { new System.IDisposable with member _.Dispose() = () }\n")>]
+[<TestCase("let value = NativePtr.read pointer\n")>]
+[<TestCase("let value = Unchecked.defaultof<int>\n")>]
+[<TestCase("let address () = let mutable value = 42 in &&value\n")>]
+[<TestCase("type Buffer = nativeptr<byte>\n")>]
+[<TestCase("let token = typeof<int>\n")>]
+[<TestCase("let run () = Microsoft.FSharp.Control.TaskBuilder.task { return 42 }\n")>]
 let ``unsupported dialect source refuses the whole file batch before writes`` source =
   withDirectory (fun directory ->
     let first = write directory "valid.clef" "let answer=42\n"

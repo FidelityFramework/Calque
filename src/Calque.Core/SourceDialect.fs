@@ -1,10 +1,11 @@
 module internal Calque.Core.SourceDialect
 
 open Calque.Core.SyntaxOak
+open System.Collections.Generic
 
 // Inspect syntax roles in the Oak, keeping strings, comments and quoted identifiers intact.
-// Clef has no CLR widening, nulls, object model or .NET task. This guard refuses those parser forms;
-// it does not resolve names or decide what a qualified function call means.
+// Refuse surface forms that the Clef contract excludes. This remains a syntax
+// guard; type, lifetime and proof settlement belong to CCS.
 let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
   let unsupported text =
     raise (FormatException($"Calque cannot yet format the Clef source form '{text}'."))
@@ -12,15 +13,82 @@ let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
   let refuse text =
     raise (FormatException($"'{text}' is not permitted in Clef source."))
 
-  let inspectTypeIdentifier (identifier: IdentListNode) =
-    let names =
-      identifier.Content
-      |> List.choose (function IdentifierOrDot.Ident token -> Some token.Text | _ -> None)
+  let namesOfIdentifier (identifier: IdentListNode) =
+    identifier.Content
+    |> List.choose (function IdentifierOrDot.Ident token -> Some token.Text | _ -> None)
 
+  let withoutGlobal = function
+    | "global" :: rest -> rest
+    | names -> names
+
+  let inspectReference names =
+    match withoutGlobal names with
+    | "NativePtr" :: _
+    | "Microsoft" :: "FSharp" :: "NativeInterop" :: _ -> refuse "raw-pointer interop"
+    | "Unchecked" :: _
+    | "Microsoft" :: "FSharp" :: "Core" :: "Unchecked" :: _ -> refuse "Unchecked construction"
+    | "Microsoft" :: "FSharp" :: "Core" :: "Operators" :: operation :: _
+        when List.contains operation ["box"; "unbox"; "typeof"; "typedefof"] -> refuse "boxing or runtime type reification"
+    | "System" :: ("IntPtr" | "UIntPtr") :: _ -> refuse "raw-pointer interop"
+    | "System" :: ("Type" | "RuntimeTypeHandle") :: _ -> refuse "runtime type reification"
+    | _ -> ()
+
+  let inspectTypeIdentifier (identifier: IdentListNode) =
+    let names = namesOfIdentifier identifier |> withoutGlobal
     match names with
     | [ "obj" ] -> refuse "obj type"
-    | [ "System"; "Object" ]
-    | [ "global"; "System"; "Object" ] -> refuse "System.Object type"
+    | [ "System"; "Object" ] -> refuse "System.Object type"
+    | [ "nativeptr" ]
+    | [ "voidptr" ]
+    | [ "void*" ]
+    | [ "System"; "IntPtr" ]
+    | [ "System"; "UIntPtr" ] -> refuse "raw-pointer type"
+    | [ "System"; "Type" ]
+    | [ "System"; "RuntimeTypeHandle" ] -> refuse "runtime type reification"
+    | _ -> inspectReference names
+
+  // The Oak keeps dotted names as chains. Read just their name prefix: a call
+  // argument, index or computed receiver never becomes part of that name.
+  let rec expressionName = function
+    | Expr.Ident identifier -> Some [identifier.Text]
+    | Expr.OptVar identifier -> Some (namesOfIdentifier identifier.Identifier)
+    | Expr.TypeApp application -> expressionName application.Identifier
+    | Expr.Paren expression -> expressionName expression.Expr
+    | Expr.Chain chain ->
+      chain.Segments
+      |> List.fold (fun prefix segment ->
+        match prefix, segment with
+        | Some names, (ChainSegment.DotMember(_, memberExpr) | ChainSegment.DotApplication(_, memberExpr, _)) ->
+          expressionName memberExpr |> Option.map (fun suffix -> names @ suffix)
+        | Some names, _ -> Some names
+        | _ -> None) (expressionName chain.Head)
+    | _ -> None
+
+  let inspectExpressionName expression =
+    expressionName expression |> Option.iter (fun names ->
+      inspectReference names
+      match withoutGlobal names with
+      | [ "box" ]
+      | [ "unbox" ]
+      | [ "typeof" ]
+      | [ "typedefof" ] -> refuse "boxing or runtime type reification"
+      | [ "stackalloc" ] -> refuse "raw-pointer allocation"
+      | _ -> ())
+
+  // Member-name fragments are expressions in the inherited Oak. Remember
+  // their exact nodes so .box/.NativePtr do not become bare intrinsic names.
+  let memberNames = HashSet<Node>()
+  let rec markMemberName expression =
+    checkpoint ()
+    memberNames.Add(Expr.Node expression) |> ignore
+    match expression with
+    | Expr.TypeApp application -> markMemberName application.Identifier
+    | Expr.Paren expression -> markMemberName expression.Expr
+    | Expr.Chain chain ->
+      markMemberName chain.Head
+      chain.Segments |> List.iter (function
+        | ChainSegment.DotMember(_, name) | ChainSegment.DotApplication(_, name, _) -> markMemberName name
+        | _ -> ())
     | _ -> ()
 
   // Long identifiers serve several source roles. Only a Type.LongIdent is an explicit type use;
@@ -100,6 +168,8 @@ let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
 
     match node with
     | :? SingleTextNode as token ->
+      if token.IsExpressionIdentifier && not (memberNames.Contains node) then
+        inspectExpressionName (Expr.Ident token)
       match token.Text with
       | "eager"
       | "__LINE__"
@@ -115,7 +185,9 @@ let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
       | ":?>"
       | ":?" -> refuse expression.Operator
       | _ -> inspectType expression.Type
-    | :? ExprSingleNode as expression when expression.Leading.Text = "upcast" || expression.Leading.Text = "downcast" ->
+    | :? ExprSingleNode as expression when
+        expression.Leading.Text = "upcast" || expression.Leading.Text = "downcast" ||
+        expression.Leading.Text = "fixed" || expression.Leading.Text = "&&" ->
       refuse expression.Leading.Text
     | :? ExprPrefixAppNode as expression when expression.Operator.Text = "%" || expression.Operator.Text = "%%" ->
       refuse "quotation splice"
@@ -124,9 +196,23 @@ let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
     | :? ExprNewNode -> refuse "object constructor"
     // Only the builder position names .NET task; a binding or field called task stays ordinary syntax.
     | :? ExprNamedComputationNode as computation ->
-      match computation.Name with
-      | Expr.Ident builder when builder.Text = "task" -> refuse "task computation expression"
+      match expressionName computation.Name |> Option.map withoutGlobal with
+      | Some [ "task" ]
+      | Some [ "Microsoft"; "FSharp"; "Control"; "task" ]
+      | Some [ "Microsoft"; "FSharp"; "Control"; "TaskBuilder"; "task" ] -> refuse "task computation expression"
       | _ -> ()
+    | :? ExprChain as expression ->
+      if not (memberNames.Contains node) then inspectExpressionName (Expr.Chain expression)
+      expression.Segments |> List.iter (function
+        | ChainSegment.DotMember(_, name) | ChainSegment.DotApplication(_, name, _) -> markMemberName name
+        | _ -> ())
+    | :? ExprOptVarNode as identifier ->
+      if not (memberNames.Contains node) then inspectExpressionName (Expr.OptVar identifier)
+    | :? ExprAppNode as application ->
+      inspectExpressionName application.FunctionExpr
+      application.Arguments |> List.iter inspectExpressionName
+    | :? ExprAppSingleParenArgNode as application -> inspectExpressionName application.FunctionExpr
+    | :? ExprAppWithLambdaNode as application -> inspectExpressionName application.FunctionName
     | :? ExprTraitCallNode -> unsupported "compile-time member invocation"
     | :? TypeDefnRegularNode -> refuse "class or interface declaration"
     | :? TypeDefnExplicitBodyNode as body when body.Kind.Text = "class" || body.Kind.Text = "interface" ->
@@ -144,18 +230,31 @@ let ensureSupportedWithCheckpoint checkpoint (oak: Oak) : unit =
     | :? MemberDefnAbstractSlotNode
     | :? MemberDefnPropertyGetSetNode
     | :? MemberDefnSigMemberNode -> refuse "member declaration"
-    | :? BindingNode as binding -> inspectMemberKeywords binding.LeadingKeyword
+    | :? BindingNode as binding ->
+      inspectMemberKeywords binding.LeadingKeyword
+      inspectExpressionName binding.Expr
     | :? PatParameterNode as parameter -> parameter.Type |> Option.iter inspectType
     | :? BindingReturnInfoNode as annotation -> inspectType annotation.Type
     | :? FieldNode as field -> inspectType field.Type
     | :? TypeSpreadNode as spread -> inspectType spread.Type
     | :? TypeDefnAbbrevNode as abbreviation -> inspectType abbreviation.Type
-    | :? ExprTypeAppNode as application -> application.TypeParameters |> List.iter inspectType
+    | :? ExprTypeAppNode as application ->
+      if not (memberNames.Contains node) then inspectExpressionName application.Identifier
+      application.TypeParameters |> List.iter inspectType
     | :? ValNode as value ->
       value.LeadingKeyword |> Option.iter inspectMemberKeywords
       inspectType value.Type
     | :? OpenTargetNode as target -> inspectType target.Target
-    | :? ExternBindingNode as binding -> inspectType binding.Type
+    | :? OpenModuleOrNamespaceNode as declaration -> inspectReference (namesOfIdentifier declaration.Name)
+    | :? ModuleAbbrevNode as declaration -> inspectReference (namesOfIdentifier declaration.Alias)
+    | :? AttributeNode as attribute ->
+      match namesOfIdentifier attribute.TypeName |> withoutGlobal with
+      | [ "DllImport" ]
+      | [ "DllImportAttribute" ]
+      | [ "System"; "Runtime"; "InteropServices"; "DllImport" ]
+      | [ "System"; "Runtime"; "InteropServices"; "DllImportAttribute" ] -> refuse "managed P/Invoke"
+      | _ -> ()
+    | :? ExternBindingNode -> refuse "managed extern declaration"
     | :? ExternBindingPatternNode as parameter -> parameter.Type |> Option.iter inspectType
     | :? StaticOptimizationConstraintWhenTyparTyconEqualsTyconNode as constraintNode -> inspectType constraintNode.Type
     | :? TypeConstraintDefaultsToTypeNode as constraintNode -> inspectType constraintNode.Type

@@ -22,6 +22,11 @@ HelloArty and HelloWayland. Broader support requires a Clef parser adapter.
 - Nulls, OO syntax and CLR widening such as `:> obj` are refused.
 - Clef admits no .NET `task`: `task { ... }` computation expressions are refused.
   A binding or field named `task` remains ordinary source.
+- Raw pointer types and operations (`NativePtr`, `nativeptr`, `voidptr`, `fixed`,
+  `stackalloc`, and unary `&&`), `Unchecked` construction, boxing, runtime type
+  tokens and managed P/Invoke are refused before writes. Comments, literals and
+  escaped names remain text; native `CHandle`, `FnPtr`, arrays and `async` remain
+  available to format. CCS owns their semantic and proof checks.
 
 ## Components and integration
 

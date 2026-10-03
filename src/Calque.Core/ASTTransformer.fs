@@ -1880,7 +1880,9 @@ let mkExpr (creationAide: CreationAide) (e: SynExpr) : Expr =
 
         ExprIfThenElifNode(elifs, optElse, exprRange) |> Expr.IfThenElif
 
-    | SynExpr.Ident ident -> mkIdent ident |> Expr.Ident
+    | SynExpr.Ident ident ->
+        let token = mkIdent ident
+        SingleTextNode(token.Text, token.Range, isExpressionIdentifier = true) |> Expr.Ident
     | SynExpr.LongIdent(isOpt, synLongIdent, _, m) ->
         ExprOptVarNode(isOpt, mkSynLongIdent creationAide synLongIdent, m)
         |> Expr.OptVar

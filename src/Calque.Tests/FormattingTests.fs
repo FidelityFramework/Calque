@@ -99,6 +99,89 @@ let ``a binding or field named task remains ordinary source`` source =
   | Ok code -> Assert.That(code, Is.EqualTo source)
   | Error reason -> Assert.Fail(sprintf "ordinary task name was refused: %s" reason)
 
+[<TestCase("let read pointer = NativePtr.read pointer\n", "raw-pointer interop")>]
+[<TestCase("let read pointer = global.Microsoft.FSharp.NativeInterop.NativePtr.read pointer\n", "raw-pointer interop")>]
+[<TestCase("open Microsoft.FSharp.NativeInterop\nlet value = 42\n", "raw-pointer interop")>]
+[<TestCase("module Pointer = NativePtr\n", "raw-pointer interop")>]
+[<TestCase("type Buffer = nativeptr<byte>\n", "raw-pointer type")>]
+[<TestCase("type Buffer = byte nativeptr\n", "raw-pointer type")>]
+[<TestCase("let identity (pointer: voidptr) = pointer\n", "raw-pointer type")>]
+[<TestCase("let identity (pointer: global.System.IntPtr) = pointer\n", "raw-pointer type")>]
+[<TestCase("let address () = let mutable value = 42 in &&value\n", "&&")>]
+[<TestCase("let pin buffer = fixed buffer\n", "fixed")>]
+[<TestCase("let allocate () = stackalloc<byte> 16\n", "raw-pointer allocation")>]
+[<TestCase("let value = Unchecked.defaultof<int>\n", "Unchecked construction")>]
+[<TestCase("let factory = Unchecked.defaultof\n", "Unchecked construction")>]
+[<TestCase("module Defaults = Microsoft.FSharp.Core.Unchecked\n", "Unchecked construction")>]
+[<TestCase("let declaration = <@ NativePtr.read pointer @>\n", "raw-pointer interop")>]
+[<TestCase("let declaration = <@@ Unchecked.defaultof<int> @@>\n", "Unchecked construction")>]
+[<TestCase("#if LEGACY\nlet value = NativePtr.read pointer\n#else\nlet value = 42\n#endif\n", "raw-pointer interop")>]
+let ``raw pointers and unchecked construction are refused in their syntax roles`` source form =
+  match Formatting.format source with
+  | Error reason -> Assert.That(reason, Does.Contain (sprintf "'%s' is not permitted in Clef source" form))
+  | Ok code -> Assert.Fail(sprintf "forbidden pointer source was rewritten: %s" code)
+
+[<TestCase("let value = box 42\n")>]
+[<TestCase("let value = unbox<int> original\n")>]
+[<TestCase("let token = typeof<int>\n")>]
+[<TestCase("let token = typedefof<list<_>>\n")>]
+[<TestCase("let token: System.Type = value\n")>]
+[<TestCase("let token: System.RuntimeTypeHandle = value\n")>]
+[<TestCase("[<DllImport(\"c\")>]\nextern int abs(int value)\n")>]
+[<TestCase("[<System.Runtime.InteropServices.DllImportAttribute(\"c\")>]\nextern int abs(int value)\n")>]
+[<TestCase("let run () = Microsoft.FSharp.Control.TaskBuilder.task { return 42 }\n")>]
+[<TestCase("let value = global.Microsoft.FSharp.Core.Operators.box 42\n")>]
+[<TestCase("let token = Microsoft.FSharp.Core.Operators.typeof<int>\n")>]
+[<TestCase("let aliases = [ box ]\n")>]
+[<TestCase("let aliases = (box, box)\n")>]
+[<TestCase("let aliases = { Convert = box }\n")>]
+[<TestCase("let alias = fun () -> box\n")>]
+[<TestCase("let alias = if selected then box else box\n")>]
+[<TestCase("let pointer = System.IntPtr.Zero\n")>]
+[<TestCase("let token = System.Type.GetType \"X\"\n")>]
+[<TestCase("let value = NativePtr.read(pointer).[0]\n")>]
+let ``runtime reification and managed imports are refused`` source =
+  match Formatting.format source with
+  | Error reason -> Assert.That(reason, Does.Contain "not permitted in Clef source")
+  | Ok code -> Assert.Fail(sprintf "managed source was rewritten: %s" code)
+
+[<Test>]
+let ``native carriers ordinary names and numeric spelling survive the guard`` () =
+  let source = """type Context = { Entry: FnPtr<int -> int>; Handle: option<CHandle<unit>>; NativePtr: int }
+let callback value = value
+let context = { Entry = FnPtr.ofFunction callback; Handle = None; NativePtr = 42 }
+let buffer = [| 0; 1; 2 |]
+let pointerWord: nativeint = 42n
+let quoted = <@ context.NativePtr + buffer[0] @>
+let suspended = async { return context.NativePtr }
+let ``NativePtr`` value = value
+let ``Unchecked`` value = value
+let named = ``Unchecked`` (``NativePtr`` context.NativePtr)
+let combine left right = left && right
+type Ordinary = { box: int; typeof: int; Unchecked: int }
+let fields = { box = 1; typeof = 2; Unchecked = 3 }
+let fieldSum = fields.box + fields.typeof + fields.Unchecked
+let ``box`` value = value
+let ordinary = [ ``box`` ]
+"""
+  let code = formatted source
+  Assert.That(formatted code, Is.EqualTo code)
+  for text in ["FnPtr<int -> int>"; "option<CHandle<unit>>"; "42n"; "async"; "``NativePtr``"; "``Unchecked``"; "left && right"] do
+    Assert.That(code, Does.Contain text)
+
+[<Test>]
+let ``pointer and BCL words in comments and literals remain text`` () =
+  let source = """// NativePtr.read Unchecked.defaultof nativeptr && fixed task typeof
+(* NativePtr.read (* Unchecked.defaultof *) box *)
+let text = "NativePtr.read Unchecked.defaultof nativeptr && fixed task typeof"
+let value = 42
+"""
+  let code = formatted source
+  Assert.That(formatted code, Is.EqualTo code)
+  Assert.That(code, Does.Contain "// NativePtr.read Unchecked.defaultof nativeptr && fixed task typeof")
+  Assert.That(code, Does.Contain "(* NativePtr.read (* Unchecked.defaultof *) box *)")
+  Assert.That(code, Does.Contain "\"NativePtr.read Unchecked.defaultof nativeptr && fixed task typeof\"")
+
 [<Test>]
 let ``inconclusive conditional coverage refuses valid source instead of dropping a branch`` () =
   let source = """module ConditionalCoverage
